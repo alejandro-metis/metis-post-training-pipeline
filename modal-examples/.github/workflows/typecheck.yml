@@ -1,0 +1,25 @@
+name: Typecheck
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  mypy:
+    name: MyPy
+    runs-on: ubuntu-24.04
+
+    steps:
+      - uses: actions/checkout@f43a0e5ff2bd294095638e18286ca9a3d1956744 # v3
+
+      - uses: actions/setup-python@65d7f2d534ac1bc67fcd62888c5f4f3d2cb2b236 # v4
+        with:
+          python-version: "3.11"
+
+      - name: Install mypy
+        run: pip install mypy==0.950
+
+      - name: Run
+        run: python3 internal/typecheck.py
