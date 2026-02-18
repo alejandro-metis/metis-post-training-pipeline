@@ -19,10 +19,11 @@ app = modal.App("ace-grpo-verl")
 # Image: verl base + openai SDK for reward function
 VERL_REPO_PATH: Path = Path("/root/verl")
 image = (
-    modal.Image.from_registry("verlai/verl:app-verl0.4-vllm0.8.5-mcore0.12.1")
+    modal.Image.from_registry("verlai/verl:vllm011.latest", setup_dockerfile_commands=["ENTRYPOINT []"])
+    .env({"VLLM_TARGET_DEVICE": "cuda"})
     .apt_install("git")
     .run_commands(f"git clone https://github.com/volcengine/verl {VERL_REPO_PATH}")
-    .uv_pip_install("verl[vllm]==0.4.1", "openai")
+    .uv_pip_install("verl[vllm]==0.7.0", "openai")
 )
 
 # Volumes
