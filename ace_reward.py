@@ -1,106 +1,73 @@
-"""
-ACE reward function for verl GRPO training.
+"""ACE reward function for verl GRPO training.
 
-Uses OpenAI gpt-4o-mini as LLM judge to evaluate model responses
-against ACE criteria. Compatible with verl's reward function signature.
+Thin wrapper around ace_scoring that returns float for verl's interface.
+For custom RL reward shaping, use compute_reward_structured() to get the
+full TaskResult with per-criterion scores, then shape however you want.
+
+verl interface: compute_reward(data_source, solution_str, ground_truth, extra_info) -> float
 """
 
 import json
-import os
 
-from openai import OpenAI
-
-JUDGE_MODEL = "gpt-4o-mini"
-JUDGE_TEMPERATURE = 0.0
-
-_client = None
-
-
-def _get_client():
-    global _client
-    if _client is None:
-        _client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
-    return _client
+from ace_scoring.scorer import grade_task
+from ace_scoring.sources import sources_from_tool_history
+from ace_scoring.types import TaskResult
 
 
 def compute_reward(
-    data_source: str, solution_str: str, ground_truth: str, extra_info: dict
+    data_source: str,
+    solution_str: str,
+    ground_truth: str,
+    extra_info: dict,
 ) -> float:
-    """Evaluate a model response against ACE criteria using LLM judge.
+    """Evaluate a model response against ACE criteria.
 
-    Args:
-        data_source: Dataset identifier (e.g. "mercor/ACE")
-        solution_str: The model's generated response
-        ground_truth: JSON-stringified list of criteria
-        extra_info: Metadata dict with domain, task_id, etc.
+    Returns float reward in [-1.0, 1.0].
+    Normalized: total_score / num_criteria.
+    Hurdle gate: any hurdle <= 0 -> 0.0.
+    """
+    result = compute_reward_structured(data_source, solution_str, ground_truth, extra_info)
+    return result.to_reward(normalize=True)
 
-    Returns:
-        Float reward in [0.0, 1.0]. 0.0 if any hurdle criterion fails.
+
+def compute_reward_structured(
+    data_source: str,
+    solution_str: str,
+    ground_truth: str,
+    extra_info: dict,
+) -> TaskResult:
+    """Same as compute_reward but returns full structured TaskResult.
+
+    Use this for custom RL reward shaping:
+        result = compute_reward_structured(...)
+
+        # Access per-criterion scores
+        for cr in result.detailed_results:
+            cr.score        # -1, 0, or +1
+            cr.type         # criterion type
+            cr.hurdle_tag   # "Hurdle" or "Not"
+            cr.stage_reached  # where grading stopped
+            cr.stage_1_result # full Stage 1 output
+            cr.stage_2_result # full Stage 2 output (grounding)
+
+        # Custom shaping examples:
+        # reward = result.to_reward(normalize=False)  # raw sum
+        # grounding_penalty = result.summary["fail_source_count"] * -0.5
+        # hurdle_bonus = 0.5 if result.summary["hurdle_pass_count"] == result.summary["hurdle_count"] else 0.0
     """
     criteria = json.loads(ground_truth)
-
     if not criteria:
-        return 0.0
+        return TaskResult(task_id=extra_info.get("task_id", "unknown"), num_criteria=0)
 
-    criteria_block = "\n".join(
-        f"{i+1}. [ID: {c['criterion_id']}] [Hurdle: {c['hurdle_tag']}] {c['description']}"
-        for i, c in enumerate(criteria)
+    tool_history = extra_info.get("tool_history")
+    sources = sources_from_tool_history(tool_history) if tool_history else []
+
+    return grade_task(
+        task_id=extra_info.get("task_id", "unknown"),
+        response_text=solution_str,
+        criteria=criteria,
+        sources=sources,
+        product_source_map=None,
+        query=extra_info.get("prompt", ""),
+        domain=extra_info.get("domain", "unknown"),
     )
-
-    prompt = f"""You are evaluating an AI assistant's response against a set of criteria.
-
-For each criterion, determine if the response PASSES or FAILS based ONLY on what is explicitly stated in the response text. Do not use any background knowledge.
-
-RESPONSE:
-{solution_str}
-
-CRITERIA:
-{criteria_block}
-
-Rules:
-- A criterion passes ONLY if the response directly and explicitly addresses it
-- Implicit or inferred information does NOT count
-- Be strict but reasonable
-
-Return ONLY valid JSON — an array of objects, one per criterion, in order:
-[{{"criterion_id": "...", "pass": true/false}}]"""
-
-    try:
-        client = _get_client()
-        response = client.chat.completions.create(
-            model=JUDGE_MODEL,
-            temperature=JUDGE_TEMPERATURE,
-            messages=[{"role": "user", "content": prompt}],
-        )
-        text = response.choices[0].message.content.strip()
-
-        if "```json" in text:
-            text = text.split("```json")[1].split("```")[0].strip()
-        elif "```" in text:
-            text = text.split("```")[1].split("```")[0].strip()
-
-        results = json.loads(text)
-
-        # Build lookup for results
-        result_map = {str(r["criterion_id"]): r["pass"] for r in results}
-
-        passed = 0
-        hurdle_failed = False
-
-        for c in criteria:
-            cid = str(c["criterion_id"])
-            did_pass = result_map.get(cid, False)
-
-            if did_pass:
-                passed += 1
-            elif c["hurdle_tag"] == "Hurdle":
-                hurdle_failed = True
-
-        if hurdle_failed:
-            return 0.0
-
-        return passed / len(criteria)
-
-    except Exception as e:
-        print(f"[ace_reward] Error in compute_reward: {e}")
-        return 0.0

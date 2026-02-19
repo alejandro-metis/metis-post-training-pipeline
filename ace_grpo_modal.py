@@ -23,7 +23,7 @@ image = (
     .env({"VLLM_TARGET_DEVICE": "cuda"})
     .apt_install("git")
     .run_commands(f"git clone https://github.com/volcengine/verl {VERL_REPO_PATH}")
-    .uv_pip_install("verl[vllm]==0.7.0", "openai")
+    .uv_pip_install("verl[vllm]==0.7.0", "openai", "httpx")
 )
 
 # Volumes
@@ -39,11 +39,19 @@ checkpoints_volume = modal.Volume.from_name(
 # Where files land inside the container
 STAGED_DATA_DIR = Path("/root/ace_verl_data")
 PATH_TO_REWARD_FUNCTION: Path = Path("/root/ace_reward.py")
+PATH_TO_SEARCH_TOOL: Path = Path("/root/ace_search_tool.py")
+PATH_TO_TOOL_CONFIG: Path = Path("/root/ace_tool_config.yaml")
 REWARD_FUNCTION_NAME: str = "compute_reward"
 
 # Bake local files into the images via add_local_dir / add_local_file
 data_image = image.add_local_dir("ace_verl_data", remote_path=str(STAGED_DATA_DIR))
-train_image = image.add_local_file("ace_reward.py", remote_path=str(PATH_TO_REWARD_FUNCTION))
+train_image = (
+    image
+    .add_local_file("ace_reward.py", remote_path=str(PATH_TO_REWARD_FUNCTION))
+    .add_local_file("ace_search_tool.py", remote_path=str(PATH_TO_SEARCH_TOOL))
+    .add_local_file("ace_tool_config.yaml", remote_path=str(PATH_TO_TOOL_CONFIG))
+    .add_local_dir("ace_scoring", remote_path="/root/ace_scoring")
+)
 
 
 @app.function(image=data_image, volumes={DATA_PATH: data_volume})
@@ -69,6 +77,7 @@ def prep_dataset() -> None:
     secrets=[
         modal.Secret.from_name("wandb-secret"),
         modal.Secret.from_name("openai-secret"),
+        modal.Secret.from_name("searchapi-secret"),
     ],
     timeout=24 * 60 * MINUTES,
 )
@@ -130,6 +139,8 @@ def train(*arglist) -> None:
         # Custom reward function
         f"custom_reward_function.path={str(PATH_TO_REWARD_FUNCTION)}",
         f"custom_reward_function.name={REWARD_FUNCTION_NAME}",
+        # Tool config for search (uncomment to enable multi-turn with search)
+        # f"actor_rollout_ref.rollout.tool_kwargs.tools_config_file={str(PATH_TO_TOOL_CONFIG)}",
     ]
     if arglist:
         cmd.extend(arglist)

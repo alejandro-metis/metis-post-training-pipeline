@@ -48,13 +48,15 @@ def load_ace_rows(domain, ace_dir=None, from_hf=False):
 
 def group_by_task(rows):
     """Group criterion rows by Task ID."""
-    tasks = defaultdict(lambda: {"prompt": None, "criteria": []})
+    tasks = defaultdict(lambda: {"prompt": None, "criteria": [], "shop_vs_product": None})
 
     for row in rows:
         task_id = str(row["Task ID"])
 
         if tasks[task_id]["prompt"] is None:
             tasks[task_id]["prompt"] = row.get("Specified Prompt") or row["Prompt"]
+            # Shopping domain has "Shop vs. Product" per task (values: "Product" or "Shop")
+            tasks[task_id]["shop_vs_product"] = row.get("Shop vs. Product")
 
         tasks[task_id]["criteria"].append(
             {
@@ -93,6 +95,7 @@ def convert_domain(domain, ace_dir=None, from_hf=False, data_source="mercor/ACE"
                 "num_criteria": len(criteria),
                 "num_hurdles": sum(1 for c in criteria if c["hurdle_tag"] == "Hurdle"),
                 "num_grounded": sum(1 for c in criteria if c["grounding_check"] == "Grounded"),
+                "shop_vs_product": task_data.get("shop_vs_product") or "",
             },
         }
         records.append(record)
@@ -122,6 +125,7 @@ def records_to_parquet(records, output_path):
     ei_num_criteria = [r["extra_info"]["num_criteria"] for r in records]
     ei_num_hurdles = [r["extra_info"]["num_hurdles"] for r in records]
     ei_num_grounded = [r["extra_info"]["num_grounded"] for r in records]
+    ei_shop_vs_product = [r["extra_info"]["shop_vs_product"] for r in records]
 
     # Define Arrow schema
     prompt_type = pa.list_(
@@ -137,6 +141,7 @@ def records_to_parquet(records, output_path):
             ("num_criteria", pa.int64()),
             ("num_hurdles", pa.int64()),
             ("num_grounded", pa.int64()),
+            ("shop_vs_product", pa.string()),
         ]
     )
 
@@ -156,8 +161,9 @@ def records_to_parquet(records, output_path):
                     pa.array(ei_num_criteria, type=pa.int64()),
                     pa.array(ei_num_hurdles, type=pa.int64()),
                     pa.array(ei_num_grounded, type=pa.int64()),
+                    pa.array(ei_shop_vs_product),
                 ],
-                names=["domain", "task_id", "num_criteria", "num_hurdles", "num_grounded"],
+                names=["domain", "task_id", "num_criteria", "num_hurdles", "num_grounded", "shop_vs_product"],
             ),
         }
     )

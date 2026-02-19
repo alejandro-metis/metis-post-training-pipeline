@@ -1,0 +1,44 @@
+tools:
+  - class_name: "ace_search_tool.AceSearchTool"
+    config:
+      type: native
+      max_results: 5
+      max_searches_per_rollout: 5
+    tool_schema:
+      type: function
+      function:
+        name: web_search
+        description: >
+          Search the web for current information about products, prices,
+          reviews, availability, and purchase links. Use this to find
+          real, up-to-date information for your recommendations.
+        parameters:
+          type: object
+          properties:
+            query:
+              type: string
+              description: "The search query. Be specific — include product names, features, or price ranges."
+          required:
+            - query
+
+  - class_name: "ace_search_tool.AceBrowseTool"
+    config:
+      type: native
+      max_browses_per_rollout: 5
+      max_content_chars: 8000
+    tool_schema:
+      type: function
+      function:
+        name: browse_page
+        description: >
+          Fetch and read the full content of a web page. Use this after
+          searching to get detailed product information, exact prices,
+          specifications, availability, and purchase links from the source.
+        parameters:
+          type: object
+          properties:
+            url:
+              type: string
+              description: "The URL of the page to read."
+          required:
+            - url
