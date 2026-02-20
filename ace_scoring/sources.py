@@ -2,15 +2,13 @@
 
 Handles three modes:
 1. From tool_history (RL training / eval with tools)
-2. From response URLs via Jina Reader (replaces Firecrawl)
+2. From response URLs via Jina Reader (for models without tool use)
 3. Build source text for Stage 2 grounding prompts
 """
 
 import re
 
-import httpx
-
-JINA_READER_BASE = "https://r.jina.ai"
+from ace_scoring.jina import extract_title, fetch_page
 
 
 def sources_from_tool_history(tool_history: dict) -> list[dict]:
@@ -27,20 +25,14 @@ def sources_from_tool_history(tool_history: dict) -> list[dict]:
         if not url or url in seen_urls:
             continue
         seen_urls.add(url)
-        sources.append({
-            "source_number": len(sources) + 1,
-            "source_title": page.get("title", url),
-            "source_link": url,
-            "relevant_text": [],
-            "webpage_content": {
-                "title": page.get("title", ""),
-                "url": url,
-                "markdown": page.get("markdown", ""),
-                "text": "",
-                "error": None,
-                "source_type": "webpage",
-            },
-        })
+        sources.append(
+            _make_source(
+                len(sources) + 1,
+                page.get("title", url),
+                url,
+                markdown=page.get("markdown", ""),
+            )
+        )
 
     for search in tool_history.get("searches", []):
         for result in search.get("results", {}).get("organic_results", []):
@@ -48,20 +40,15 @@ def sources_from_tool_history(tool_history: dict) -> list[dict]:
             if url in seen_urls or not url:
                 continue
             seen_urls.add(url)
-            sources.append({
-                "source_number": len(sources) + 1,
-                "source_title": result.get("title", url),
-                "source_link": url,
-                "relevant_text": [],
-                "webpage_content": {
-                    "title": result.get("title", ""),
-                    "url": url,
-                    "markdown": result.get("snippet", ""),
-                    "text": result.get("snippet", ""),
-                    "error": None,
-                    "source_type": "webpage",
-                },
-            })
+            sources.append(
+                _make_source(
+                    len(sources) + 1,
+                    result.get("title", url),
+                    url,
+                    markdown=result.get("snippet", ""),
+                    text=result.get("snippet", ""),
+                )
+            )
 
     return sources
 
@@ -91,27 +78,16 @@ def enrich_snippet_sources(
         if not url:
             continue
 
-        try:
-            resp = httpx.get(
-                f"{JINA_READER_BASE}/{url}",
-                headers={"Accept": "text/markdown"},
-                timeout=15.0,
-            )
-            resp.raise_for_status()
-            page_markdown = resp.text[:max_chars_per_source]
+        page_markdown, err = fetch_page(url, max_chars=max_chars_per_source)
+        if err:
+            print(f"[ace_scoring] Failed to enrich {url}: {err}")
+            continue
 
-            title = url
-            for line in page_markdown.split("\n"):
-                if line.strip().startswith("# "):
-                    title = line.strip()[2:].strip()
-                    break
-
-            wc["markdown"] = page_markdown
-            wc["title"] = title
-            src["source_title"] = title
-            enriched += 1
-        except Exception:
-            pass  # keep original snippet if fetch fails
+        title = extract_title(page_markdown, fallback=url)
+        wc["markdown"] = page_markdown
+        wc["title"] = title
+        src["source_title"] = title
+        enriched += 1
 
     return sources
 
@@ -123,57 +99,29 @@ def sources_from_response_urls(
 ) -> list[dict]:
     """Scrape URLs found in response text via Jina Reader.
 
-    Replaces Firecrawl for cases without tool_history.
+    For scoring models that don't use tools but embed URLs directly
+    in their responses (e.g., GPT zeroshot). Not currently called in
+    the pipeline but kept for this use case.
     """
     urls = re.findall(r'https?://[^\s)<>\[\]"\']+', response_text)
     urls = list(dict.fromkeys(urls))[:max_sources]
 
     sources = []
     for url in urls:
-        try:
-            resp = httpx.get(
-                f"{JINA_READER_BASE}/{url}",
-                headers={"Accept": "text/markdown"},
-                timeout=20.0,
+        markdown, err = fetch_page(url, timeout=20.0, max_chars=max_chars_per_source)
+        if err:
+            print(f"[ace_scoring] Failed to fetch {url}: {err}")
+            sources.append(_make_source(len(sources) + 1, url, url, error=err))
+        else:
+            title = extract_title(markdown, fallback=url)
+            sources.append(
+                _make_source(
+                    len(sources) + 1,
+                    title,
+                    url,
+                    markdown=markdown,
+                )
             )
-            resp.raise_for_status()
-            markdown = resp.text[:max_chars_per_source]
-
-            title = url
-            for line in markdown.split("\n"):
-                if line.strip().startswith("# "):
-                    title = line.strip()[2:].strip()
-                    break
-
-            sources.append({
-                "source_number": len(sources) + 1,
-                "source_title": title,
-                "source_link": url,
-                "relevant_text": [],
-                "webpage_content": {
-                    "title": title,
-                    "url": url,
-                    "markdown": markdown,
-                    "text": "",
-                    "error": None,
-                    "source_type": "webpage",
-                },
-            })
-        except Exception as e:
-            sources.append({
-                "source_number": len(sources) + 1,
-                "source_title": url,
-                "source_link": url,
-                "relevant_text": [],
-                "webpage_content": {
-                    "title": "",
-                    "url": url,
-                    "markdown": "",
-                    "text": "",
-                    "error": str(e),
-                    "source_type": "webpage",
-                },
-            })
 
     return sources
 
@@ -222,3 +170,34 @@ def build_source_text_for_grounding(
         parts.append(f"Source: {title}\n{markdown}")
 
     return "\n---\n".join(parts)
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_source(
+    number: int,
+    title: str,
+    url: str,
+    *,
+    markdown: str = "",
+    text: str = "",
+    error: str | None = None,
+) -> dict:
+    """Create an autograder-compatible source dict."""
+    return {
+        "source_number": number,
+        "source_title": title,
+        "source_link": url,
+        "relevant_text": [],
+        "webpage_content": {
+            "title": title,
+            "url": url,
+            "markdown": markdown,
+            "text": text,
+            "error": error,
+            "source_type": "webpage",
+        },
+    }

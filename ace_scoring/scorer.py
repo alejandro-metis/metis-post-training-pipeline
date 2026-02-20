@@ -20,19 +20,22 @@ References:
 
 import json
 import re
-from typing import Optional
-
-import httpx
 
 from ace_scoring import prompts
+from ace_scoring.jina import fetch_page
 from ace_scoring.llm import call_judge, parse_json
 from ace_scoring.sources import build_source_text_for_grounding
 from ace_scoring.types import CriterionResult, Stage1Result, Stage2Result, TaskResult
 
+# Shared URL regex — excludes trailing ), ], ", ' that often surround URLs in text
+_URL_RE = re.compile(r'https?://[^\s)<>\[\]"\']+')
+
 
 def _is_grounded(criterion: dict) -> bool:
     """Check if criterion requires grounding verification."""
-    val = criterion.get("grounding_check", criterion.get("grounded_status", "Not Grounded"))
+    val = criterion.get(
+        "grounding_check", criterion.get("grounded_status", "Not Grounded")
+    )
     return val in ("Grounded", "Check required")
 
 
@@ -49,36 +52,14 @@ def _get_hurdle(criterion: dict) -> str:
 
 
 def _get_grounding(criterion: dict) -> str:
-    return criterion.get("grounding_check", criterion.get("grounded_status", "Not Grounded"))
+    return criterion.get(
+        "grounding_check", criterion.get("grounded_status", "Not Grounded")
+    )
 
 
 # ---------------------------------------------------------------------------
 # Route 1: Link criteria
 # ---------------------------------------------------------------------------
-
-JINA_READER_BASE = "https://r.jina.ai"
-
-
-def _scrape_url(url: str, max_chars: int = 15000) -> tuple[str, str]:
-    """Scrape a URL via Jina Reader. Returns (markdown, error_or_empty).
-
-    Catches hard errors (4xx/5xx), soft 404s, auth walls, and homepage redirects.
-    """
-    try:
-        r = httpx.get(
-            f"{JINA_READER_BASE}/{url}",
-            headers={"Accept": "text/markdown"},
-            timeout=15.0,
-        )
-        r.raise_for_status()
-        markdown = r.text[:max_chars]
-        if not markdown or len(markdown) < 100:
-            return "", "Page has no content or failed to load"
-        return markdown, ""
-    except httpx.HTTPStatusError as e:
-        return "", f"HTTP {e.response.status_code}"
-    except Exception as e:
-        return "", f"Connection failed: {e}"
 
 
 def _verify_link_with_llm(
@@ -168,36 +149,55 @@ def grade_link_criterion(
 
     if not products:
         return CriterionResult(
-            criterion_id=cid, description=criterion["description"], type=ctype,
-            score=-1, stage_reached="link_verification", hurdle_tag=hurdle,
+            criterion_id=cid,
+            description=criterion["description"],
+            type=ctype,
+            score=-1,
+            stage_reached="link_verification",
+            hurdle_tag=hurdle,
             grounding_check=grounding,
-            stage_1_result=Stage1Result(all_pass=False, reasoning="No recommendations identified"),
+            stage_1_result=Stage1Result(
+                all_pass=False, reasoning="No recommendations identified"
+            ),
             reasoning="Failed: No recommendations identified",
         )
 
-    urls_in_response = re.findall(r'https?://\S+', response_text)
+    urls_in_response = _URL_RE.findall(response_text)
     if not urls_in_response:
         return CriterionResult(
-            criterion_id=cid, description=criterion["description"], type=ctype,
-            score=-1, stage_reached="link_verification", hurdle_tag=hurdle,
+            criterion_id=cid,
+            description=criterion["description"],
+            type=ctype,
+            score=-1,
+            stage_reached="link_verification",
+            hurdle_tag=hurdle,
             grounding_check=grounding,
-            stage_1_result=Stage1Result(all_pass=False, reasoning="No URLs found in response"),
+            stage_1_result=Stage1Result(
+                all_pass=False, reasoning="No URLs found in response"
+            ),
             reasoning="Failed: No links in response",
         )
 
     # Stage 1: Extract links per product via LLM
     extract_prompt = prompts.EXTRACT_LINKS_FOR_PRODUCT.format(
-        products=json.dumps(products), response=response_text,
+        products=json.dumps(products),
+        response=response_text,
     )
     try:
         text = call_judge(extract_prompt)
         product_links = parse_json(text)
     except Exception as e:
         return CriterionResult(
-            criterion_id=cid, description=criterion["description"], type=ctype,
-            score=-1, stage_reached="link_verification", hurdle_tag=hurdle,
+            criterion_id=cid,
+            description=criterion["description"],
+            type=ctype,
+            score=-1,
+            stage_reached="link_verification",
+            hurdle_tag=hurdle,
             grounding_check=grounding,
-            stage_1_result=Stage1Result(all_pass=False, reasoning=f"Link extraction error: {e}"),
+            stage_1_result=Stage1Result(
+                all_pass=False, reasoning=f"Link extraction error: {e}"
+            ),
             reasoning=f"Error: {e}",
         )
 
@@ -205,8 +205,12 @@ def grade_link_criterion(
     products_missing_links = [p for p in products if not product_links.get(p)]
     if products_missing_links:
         return CriterionResult(
-            criterion_id=cid, description=criterion["description"], type=ctype,
-            score=-1, stage_reached="link_verification", hurdle_tag=hurdle,
+            criterion_id=cid,
+            description=criterion["description"],
+            type=ctype,
+            score=-1,
+            stage_reached="link_verification",
+            hurdle_tag=hurdle,
             grounding_check=grounding,
             stage_1_result=Stage1Result(
                 all_pass=False,
@@ -226,10 +230,12 @@ def grade_link_criterion(
 
         for url in urls[:3]:  # check up to 3 URLs per product
             # Scrape the page via Jina
-            page_content, scrape_error = _scrape_url(url)
+            page_content, scrape_error = fetch_page(url, max_chars=15000)
 
             if scrape_error:
-                link_checks.append({"url": url, "is_valid": False, "reason": scrape_error})
+                link_checks.append(
+                    {"url": url, "is_valid": False, "reason": scrape_error}
+                )
                 continue
 
             # LLM-verify the page is valid for this product
@@ -247,11 +253,13 @@ def grade_link_criterion(
                 product_passes = True
                 break  # one valid link is enough
 
-        verification_results.append({
-            "product_name": product,
-            "pass": product_passes,
-            "links_checked": link_checks,
-        })
+        verification_results.append(
+            {
+                "product_name": product,
+                "pass": product_passes,
+                "links_checked": link_checks,
+            }
+        )
         if not product_passes:
             all_pass = False
 
@@ -263,8 +271,12 @@ def grade_link_criterion(
         reasoning_parts.append(f"{vr['product_name']}: {status} ({reasons})")
 
     return CriterionResult(
-        criterion_id=cid, description=criterion["description"], type=ctype,
-        score=score, stage_reached="link_verification", hurdle_tag=hurdle,
+        criterion_id=cid,
+        description=criterion["description"],
+        type=ctype,
+        score=score,
+        stage_reached="link_verification",
+        hurdle_tag=hurdle,
         grounding_check=grounding,
         stage_1_result=Stage1Result(all_pass=True, reasoning="All products have links"),
         stage_2_result=Stage2Result(
@@ -279,6 +291,7 @@ def grade_link_criterion(
 # ---------------------------------------------------------------------------
 # Route 2: Non-grounded criteria (Stage 1 only)
 # ---------------------------------------------------------------------------
+
 
 def grade_non_grounded(
     criterion: dict,
@@ -299,9 +312,12 @@ def grade_non_grounded(
         data = parse_json(text)
         passed = data.get("pass", False)
         return CriterionResult(
-            criterion_id=cid, description=criterion["description"], type=ctype,
+            criterion_id=cid,
+            description=criterion["description"],
+            type=ctype,
             score=1 if passed else 0,
-            stage_reached="response_text_only", hurdle_tag=hurdle,
+            stage_reached="response_text_only",
+            hurdle_tag=hurdle,
             grounding_check=grounding,
             stage_1_result=Stage1Result(
                 all_pass=passed,
@@ -312,8 +328,12 @@ def grade_non_grounded(
         )
     except Exception as e:
         return CriterionResult(
-            criterion_id=cid, description=criterion["description"], type=ctype,
-            score=0, stage_reached="response_text_only", hurdle_tag=hurdle,
+            criterion_id=cid,
+            description=criterion["description"],
+            type=ctype,
+            score=0,
+            stage_reached="response_text_only",
+            hurdle_tag=hurdle,
             grounding_check=grounding,
             stage_1_result=Stage1Result(all_pass=False, reasoning=f"Error: {e}"),
             reasoning=f"Error: {e}",
@@ -323,6 +343,7 @@ def grade_non_grounded(
 # ---------------------------------------------------------------------------
 # Route 3: Grounded criteria (Stage 1 + Stage 2)
 # ---------------------------------------------------------------------------
+
 
 def grade_grounded(
     criterion: dict,
@@ -338,7 +359,9 @@ def grade_grounded(
     grounding = _get_grounding(criterion)
 
     # --- Stage 1: Response text check ---
-    product_list = ", ".join(products) if products else "(No recommendations identified)"
+    product_list = (
+        ", ".join(products) if products else "(No recommendations identified)"
+    )
     prompt = prompts.STAGE_1_GROUNDED.format(
         criterion_description=criterion["description"],
         response=response_text,
@@ -350,8 +373,12 @@ def grade_grounded(
         stage1_data = parse_json(text)
     except Exception as e:
         return CriterionResult(
-            criterion_id=cid, description=criterion["description"], type=ctype,
-            score=0, stage_reached="response_text", hurdle_tag=hurdle,
+            criterion_id=cid,
+            description=criterion["description"],
+            type=ctype,
+            score=0,
+            stage_reached="response_text",
+            hurdle_tag=hurdle,
             grounding_check=grounding,
             stage_1_result=Stage1Result(all_pass=False, reasoning=f"Error: {e}"),
             reasoning=f"Stage 1 error: {e}",
@@ -367,8 +394,12 @@ def grade_grounded(
 
     if not stage1.all_pass:
         return CriterionResult(
-            criterion_id=cid, description=criterion["description"], type=ctype,
-            score=0, stage_reached="response_text", hurdle_tag=hurdle,
+            criterion_id=cid,
+            description=criterion["description"],
+            type=ctype,
+            score=0,
+            stage_reached="response_text",
+            hurdle_tag=hurdle,
             grounding_check=grounding,
             stage_1_result=stage1,
             reasoning=f"Failed response text check: {stage1.reasoning}",
@@ -379,43 +410,61 @@ def grade_grounded(
         # No sources → can't verify grounding → fail Stage 2
         # Matches autograder: "No grounding sources available" → -1
         return CriterionResult(
-            criterion_id=cid, description=criterion["description"], type=ctype,
-            score=-1, stage_reached="grounded_sources", hurdle_tag=hurdle,
+            criterion_id=cid,
+            description=criterion["description"],
+            type=ctype,
+            score=-1,
+            stage_reached="grounded_sources",
+            hurdle_tag=hurdle,
             grounding_check=grounding,
             stage_1_result=stage1,
             stage_2_result=Stage2Result(
-                all_pass=False, reasoning="No grounding sources available for verification",
+                all_pass=False,
+                reasoning="No grounding sources available for verification",
             ),
             reasoning="Passed Stage 1; failed Stage 2 (no sources)",
         )
 
     # Determine which products passed Stage 1
-    passed_products = [
-        p["recommendation_name"]
-        for p in stage1.products_checked
-        if p.get("meets_criterion", False)
-    ] if stage1.products_checked else products
+    passed_products = (
+        [
+            p["recommendation_name"]
+            for p in stage1.products_checked
+            if p.get("meets_criterion", False)
+        ]
+        if stage1.products_checked
+        else products
+    )
 
     if not passed_products:
         # No products to verify → holistic grounding check
         stage2 = _stage2_holistic(criterion, sources)
         return CriterionResult(
-            criterion_id=cid, description=criterion["description"], type=ctype,
+            criterion_id=cid,
+            description=criterion["description"],
+            type=ctype,
             score=1 if stage2.all_pass else -1,
-            stage_reached="grounded_sources", hurdle_tag=hurdle,
+            stage_reached="grounded_sources",
+            hurdle_tag=hurdle,
             grounding_check=grounding,
-            stage_1_result=stage1, stage_2_result=stage2,
+            stage_1_result=stage1,
+            stage_2_result=stage2,
             reasoning=f"Stage 1: {stage1.reasoning} | Stage 2: {stage2.reasoning}",
         )
 
     # Per-product verification
     if product_source_map:
         stage2 = _stage2_per_product_mapped(
-            criterion, passed_products, sources, product_source_map,
+            criterion,
+            passed_products,
+            sources,
+            product_source_map,
         )
     else:
         stage2 = _stage2_per_product_batched(
-            criterion, passed_products, sources,
+            criterion,
+            passed_products,
+            sources,
         )
 
     # Apply evaluation_type logic
@@ -434,11 +483,15 @@ def grade_grounded(
     stage2.reasoning = f"Source verification: {pass_count}/{total} passed"
 
     return CriterionResult(
-        criterion_id=cid, description=criterion["description"], type=ctype,
+        criterion_id=cid,
+        description=criterion["description"],
+        type=ctype,
         score=1 if grounding_pass else -1,
-        stage_reached="grounded_sources", hurdle_tag=hurdle,
+        stage_reached="grounded_sources",
+        hurdle_tag=hurdle,
         grounding_check=grounding,
-        stage_1_result=stage1, stage_2_result=stage2,
+        stage_1_result=stage1,
+        stage_2_result=stage2,
         reasoning=f"Stage 1: {stage1.reasoning} | Stage 2: {stage2.reasoning}",
     )
 
@@ -475,14 +528,18 @@ def _stage2_per_product_mapped(
     product_results = []
     for product_name in passed_products:
         source_text = build_source_text_for_grounding(
-            sources, product_source_map, product_name,
+            sources,
+            product_source_map,
+            product_name,
         )
         if not source_text:
-            product_results.append({
-                "product_name": product_name,
-                "pass": False,
-                "reason": "No sources mapped to this product",
-            })
+            product_results.append(
+                {
+                    "product_name": product_name,
+                    "pass": False,
+                    "reason": "No sources mapped to this product",
+                }
+            )
             continue
 
         prompt = prompts.STAGE_2_PER_PRODUCT.format(
@@ -494,23 +551,29 @@ def _stage2_per_product_mapped(
             text = call_judge(prompt)
             results = parse_json(text)
             if isinstance(results, list) and results:
-                product_results.append({
-                    "product_name": product_name,
-                    "pass": results[0].get("pass", False),
-                    "reason": results[0].get("reason", ""),
-                })
+                product_results.append(
+                    {
+                        "product_name": product_name,
+                        "pass": results[0].get("pass", False),
+                        "reason": results[0].get("reason", ""),
+                    }
+                )
             else:
-                product_results.append({
+                product_results.append(
+                    {
+                        "product_name": product_name,
+                        "pass": False,
+                        "reason": "Invalid response from judge",
+                    }
+                )
+        except Exception as e:
+            product_results.append(
+                {
                     "product_name": product_name,
                     "pass": False,
-                    "reason": "Invalid response from judge",
-                })
-        except Exception as e:
-            product_results.append({
-                "product_name": product_name,
-                "pass": False,
-                "reason": f"Error: {e}",
-            })
+                    "reason": f"Error: {e}",
+                }
+            )
 
     return Stage2Result(all_pass=False, reasoning="", product_results=product_results)
 
@@ -560,6 +623,7 @@ def _stage2_per_product_batched(
 # Criterion router
 # ---------------------------------------------------------------------------
 
+
 def grade_criterion(
     criterion: dict,
     response_text: str,
@@ -574,19 +638,25 @@ def grade_criterion(
 
     if ctype == "Provides link(s)":
         return grade_link_criterion(
-            criterion, response_text, products,
-            domain=domain, shop_vs_product=shop_vs_product,
+            criterion,
+            response_text,
+            products,
+            domain=domain,
+            shop_vs_product=shop_vs_product,
         )
 
     if not _is_grounded(criterion):
         return grade_non_grounded(criterion, response_text)
 
-    return grade_grounded(criterion, response_text, products, sources, product_source_map)
+    return grade_grounded(
+        criterion, response_text, products, sources, product_source_map
+    )
 
 
 # ---------------------------------------------------------------------------
 # Task-level scoring
 # ---------------------------------------------------------------------------
+
 
 def grade_task(
     task_id: str,
@@ -624,6 +694,7 @@ def grade_task(
     # Extract products if not provided
     if products is None:
         from ace_scoring.product import extract_products
+
         has_grounded = any(_is_grounded(c) for c in criteria)
         if has_grounded or domain in ("shopping", "gaming"):
             products = extract_products(response_text, query)
@@ -634,8 +705,13 @@ def grade_task(
     results: list[CriterionResult] = []
     for c in criteria:
         result = grade_criterion(
-            c, response_text, products, sources, product_source_map,
-            domain=domain, shop_vs_product=shop_vs_product,
+            c,
+            response_text,
+            products,
+            sources,
+            product_source_map,
+            domain=domain,
+            shop_vs_product=shop_vs_product,
         )
         results.append(result)
 
@@ -650,7 +726,9 @@ def grade_task(
     # Hurdle gate (matches autograder lines 1061-1071)
     # If no hurdle criteria, no gate applied → hurdle_score = total_score.
     # If any hurdle criterion scores ≤ 0, gate fails → hurdle_score = 0.
-    hurdle_scores = [s[0] for s in scores_with_types if len(s) >= 3 and s[2] == "Hurdle"]
+    hurdle_scores = [
+        s[0] for s in scores_with_types if len(s) >= 3 and s[2] == "Hurdle"
+    ]
     if hurdle_scores and any(s <= 0 for s in hurdle_scores):
         total_hurdle_score = 0
     else:

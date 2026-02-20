@@ -5,32 +5,43 @@ Evaluates recommendations against criteria using two-stage verification
 """
 
 import json
+import logging
 import os
-import re
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
-from firecrawl import FirecrawlApp
-from typing import Dict, List, Optional, Any
 
 # Add project root to path FIRST
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
 sys.path.insert(0, project_root)
 
-from configs.logging_config import setup_logging
-from configs.config import config
-from helpers.purchase_page_verifier import verify_purchase_link, verify_gaming_link
+# --- FORKED: replaced Gemini + Firecrawl + config imports with OpenAI ---
+# from configs.logging_config import setup_logging
+# from configs.config import config
+# from helpers.purchase_page_verifier import verify_purchase_link, verify_gaming_link
+# from firecrawl import FirecrawlApp
+# from google import genai
+# from google.genai import types
 
-logger = setup_logging(__name__)
+from openai import OpenAI
 
-# New Gemini SDK imports
-from google import genai
-from google.genai import types
+logger = logging.getLogger(__name__)
+logging.basicConfig(level=logging.INFO)
 
-# Autograder Configuration Constants
-AUTOGRADER_MODEL = 'gemini-2.5-pro'  # Gemini Pro for all autograding
+
+# --- FORKED: stub link verification (Firecrawl disabled) ---
+def verify_purchase_link(product_name, url, firecrawl_app, shop_vs_product):
+    """Stub: assume links are valid when Firecrawl is not available."""
+    return {'is_valid': True, 'page_type': 'unknown', 'reason': 'Link verification skipped (Firecrawl disabled)'}
+
+def verify_gaming_link(recommendation_name, url, firecrawl_app, criterion_description):
+    """Stub: assume links are valid when Firecrawl is not available."""
+    return {'is_valid': True, 'page_type': 'unknown', 'reason': 'Link verification skipped (Firecrawl disabled)'}
+
+# Autograder Configuration — configurable via env vars
+AUTOGRADER_MODEL = os.environ.get('AUTOGRADER_MODEL', 'gpt-4o-mini')
 AUTOGRADER_TEMPERATURE = 0.0  # Deterministic evaluation
 
 
@@ -38,22 +49,21 @@ class Autograder:
     """Automated grading system for LLM recommendations"""
 
     def __init__(self):
-        # Initialize Gemini client with new SDK
-        config.validate_model_key('gemini')
-        self.client = genai.Client(api_key=config.GEMINI_API_KEY)
-        self.gen_config = types.GenerateContentConfig(temperature=AUTOGRADER_TEMPERATURE)
+        # --- FORKED: OpenAI client instead of Gemini ---
+        self.client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
+        self.model = AUTOGRADER_MODEL
         self.logs = []
-        config.validate_firecrawl()
-        self.firecrawl = FirecrawlApp(api_key=config.FIRECRAWL_API_KEY)
+        # --- FORKED: Firecrawl disabled (not needed for our eval flow) ---
+        self.firecrawl = None
 
     def _generate(self, prompt: str) -> str:
-        """Generate content using Gemini - single place for all LLM calls"""
-        result = self.client.models.generate_content(
-            model=AUTOGRADER_MODEL,
-            contents=prompt,
-            config=self.gen_config
+        """Generate content using OpenAI — single place for all LLM calls"""
+        response = self.client.chat.completions.create(
+            model=self.model,
+            temperature=AUTOGRADER_TEMPERATURE,
+            messages=[{"role": "user", "content": prompt}],
         )
-        return result.text.strip()
+        return response.choices[0].message.content.strip()
 
     def log(self, message, level='info'):
         """Add log entry"""
@@ -257,7 +267,7 @@ class Autograder:
                     print(f"      {symbol} {recommendation_name}: {'Meets criterion' if meets else 'Does not meet criterion'}")
 
             if violation:
-                self.log(f"  Violation detected - criterion fails", 'warning')
+                self.log("  Violation detected - criterion fails", 'warning')
 
             return {
                 'all_pass': all_pass,
@@ -311,7 +321,7 @@ class Autograder:
 
         # CASE 1: No products (Gaming domain - approaches/strategies without specific product names)
         if not product_map or len(product_map) == 0:
-            self.log(f"  No product map - performing holistic grounding check")
+            self.log("  No product map - performing holistic grounding check")
 
             # Get all source content
             source_contents = []
@@ -324,7 +334,7 @@ class Autograder:
                     })
 
             if not source_contents:
-                self.log(f"  No grounding sources available - cannot verify", 'warning')
+                self.log("  No grounding sources available - cannot verify", 'warning')
                 return {
                     'all_pass': False,
                     'reasoning': "No grounding sources available for verification",
@@ -673,7 +683,7 @@ class Autograder:
                 })
 
                 if verification['is_valid']:
-                    success_msg = f"Valid link (meets criterion)" if domain == 'Gaming' else f"Valid purchase page"
+                    success_msg = "Valid link (meets criterion)" if domain == 'Gaming' else "Valid purchase page"
                     product_passes = True
                     self.log(f"    {success_msg}", 'success')
                     break  # One valid link is enough
@@ -723,7 +733,7 @@ class Autograder:
         Checks response text only with strict per-recommendation validation.
         Returns score: 1 if pass, 0 if fail
         """
-        self.log(f"Non-grounding criterion (response text only)")
+        self.log("Non-grounding criterion (response text only)")
 
         # Use the SAME improved prompt as check_response_text (for consistency)
         prompt = f"""You are evaluating a response against a specific criterion.
@@ -803,7 +813,7 @@ class Autograder:
             print(f"    {status} Evaluation ({eval_type}): {data.get('reasoning', '')[:100]}...")
 
             if violation:
-                self.log(f"  Violation detected - criterion fails", 'warning')
+                self.log("  Violation detected - criterion fails", 'warning')
 
             score = 1 if all_pass else 0
 
@@ -900,7 +910,7 @@ class Autograder:
                 'reasoning': f"Failed response text check: {response_check['reasoning']}"
             }
 
-        self.log(f"Stage 1 passed - all products meet criterion in response text", 'success')
+        self.log("Stage 1 passed - all products meet criterion in response text", 'success')
         # For now, hardcode to per_product_all for all criteria, so we ensure that every product must meets the criterion
         
         # evaluation_type = 'per_product_all'
@@ -942,7 +952,6 @@ class Autograder:
         Input: grounding-sources.json with query, responseText, productSourceMap, criteria, sources
         Output: autograder-results.json with scores and detailed results
         """
-        import time
         start_time = time.time()
 
         print(f"\nStarting Autograder ({domain} Domain)")
@@ -964,7 +973,7 @@ class Autograder:
         # Read Shop vs. Product from local file (Shopping domain only)
         shop_vs_product = data.get('shop_vs_product', None) if domain == 'Shopping' else None
 
-        self.log(f"Loaded test case")
+        self.log("Loaded test case")
         self.log(f"  Domain: {domain}")
         self.log(f"  Products: {len(product_map)}")
         self.log(f"  Criteria: {len(criteria)}")
@@ -1092,9 +1101,9 @@ class Autograder:
 
         # Print summary
         print(f"\n{'='*60}")
-        print(f"Autograding Summary")
+        print("Autograding Summary")
         print(f"{'='*60}\n")
-        print(f"Criteria Scores (with types):")
+        print("Criteria Scores (with types):")
         for i, score_data in enumerate(scores_with_types, 1):
             score = score_data[0]
             ctype = score_data[1]
@@ -1102,15 +1111,15 @@ class Autograder:
             timing = criterion_timings[i-1]['time_seconds']
             hurdle_marker = "🚧 HURDLE" if hurdle == 'Hurdle' else ""
             print(f"  {i}. Score: {score:2} | Type: {ctype:40} | {hurdle_marker:10} | Time: {timing}s")
-        print(f"\nAggregate:")
+        print("\nAggregate:")
         print(f"  Pass (1):           {output['summary']['pass_count']}")
         print(f"  Fail Response (0):  {output['summary']['fail_response_count']}")
         print(f"  Fail Source (-1):   {output['summary']['fail_source_count']}")
-        print(f"\nScoring:")
+        print("\nScoring:")
         print(f"  Total Score:        {output['total_score']}")
         print(f"  Total Hurdle Score: {output['total_hurdle_score']}")
         print(f"  Hurdle Criteria:    {output['summary']['hurdle_count']} ({output['summary']['hurdle_pass_count']} passed)")
-        print(f"\nTiming:")
+        print("\nTiming:")
         if pipeline_timing:
             print(f"  Grounding Pipeline: {pipeline_timing.get('total_seconds', 0):.2f}s")
             print(f"    - Scraping: {pipeline_timing.get('scraping_seconds', 0):.2f}s")
@@ -1118,7 +1127,7 @@ class Autograder:
         if pipeline_timing:
             total_combined = pipeline_timing.get('total_seconds', 0) + total_time
             print(f"  Combined Total: {total_combined:.2f}s")
-        print(f"\n✅ Autograding complete!")
+        print("\n✅ Autograding complete!")
 
         return output
 

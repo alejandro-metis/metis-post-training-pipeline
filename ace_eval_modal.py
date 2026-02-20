@@ -25,6 +25,7 @@ import modal
 
 app = modal.App("ace-eval")
 
+
 # ---------------------------------------------------------------------------
 # Model helpers
 # ---------------------------------------------------------------------------
@@ -38,15 +39,19 @@ def _validate_model(name: str):
             f"got: {name!r}"
         )
     from huggingface_hub import model_info
+
     try:
         model_info(name)
     except Exception:
-        raise ValueError(f"Model {name!r} not found on HuggingFace Hub. Check the name.")
+        raise ValueError(
+            f"Model {name!r} not found on HuggingFace Hub. Check the name."
+        )
 
 
 def _get_param_count(model_name: str) -> float:
     """Extract parameter count (in billions) from HF model name. E.g. 'Qwen2.5-72B-Instruct' -> 72."""
     import re
+
     match = re.search(r"(\d+(?:\.\d+)?)[bB]", model_name)
     assert match, f"Could not parse parameter count from model name: {model_name!r}"
     return float(match.group(1))
@@ -69,13 +74,11 @@ def _get_tool_parser(model_name: str) -> str:
 # Modal image & resources
 # ---------------------------------------------------------------------------
 eval_image = (
-    modal.Image.from_registry(
-        "nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11"
-    )
+    modal.Image.from_registry("nvidia/cuda:12.4.0-devel-ubuntu22.04", add_python="3.11")
     .pip_install("vllm>=0.6.4", "openai", "httpx", "pyarrow")
     .env({"VLLM_TARGET_DEVICE": "cuda"})
     .add_local_file("ace_eval.py", "/root/ace_eval.py")
-    .add_local_file("ace_grounding_wrapper.py", "/root/ace_grounding_wrapper.py")
+    .add_local_file("ace_eval_prompts.py", "/root/ace_eval_prompts.py")
     .add_local_dir("ace_scoring", "/root/ace_scoring")
 )
 
@@ -86,6 +89,7 @@ SECRETS = [
     modal.Secret.from_name("huggingface-secret"),
     modal.Secret.from_name("searchapi-secret"),
     modal.Secret.from_name("openai-secret"),
+    modal.Secret.from_name("jina-secret"),
 ]
 
 VOLUMES = {
@@ -98,8 +102,16 @@ VOLUMES = {
 # Core eval logic (runs inside Modal container)
 # ---------------------------------------------------------------------------
 def _run_eval_inner(
-    model_name, tasks_json, tp_size, workers, max_turns, max_searches, max_browses,
+    model_name,
+    tasks_json,
+    tp_size,
+    workers,
+    max_turns,
+    max_searches,
+    max_browses,
     judge_model="",
+    prompt_preset="",
+    runs=1,
 ):
     import subprocess
     import sys
@@ -114,7 +126,11 @@ def _run_eval_inner(
         os.environ["ACE_JUDGE_MODEL"] = judge_model
 
     sys.path.insert(0, "/root")
-    from ace_eval import _log, eval_single_task
+    from ace_eval import _log, build_eval_summary, eval_single_task
+    from ace_eval_prompts import DEFAULT_PROMPT, get_prompt
+
+    system_prompt = get_prompt(prompt_preset or DEFAULT_PROMPT)
+    _log(f"Prompt preset: {prompt_preset or DEFAULT_PROMPT}")
 
     tasks = json.loads(tasks_json)
     tool_parser = _get_tool_parser(model_name)
@@ -124,153 +140,192 @@ def _run_eval_inner(
 
     proc = subprocess.Popen(
         [
-            "python", "-m", "vllm.entrypoints.openai.api_server",
-            "--model", model_name,
-            "--tensor-parallel-size", str(tp_size),
-            "--port", "8000",
+            "python",
+            "-m",
+            "vllm.entrypoints.openai.api_server",
+            "--model",
+            model_name,
+            "--tensor-parallel-size",
+            str(tp_size),
+            "--port",
+            "8000",
             "--trust-remote-code",
             "--enable-auto-tool-choice",
-            "--tool-call-parser", tool_parser,
-            "--max-model-len", "16384",
+            "--tool-call-parser",
+            tool_parser,
+            "--max-model-len",
+            "16384",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
     )
 
     # Wait for health (up to 10 min for model download + load)
-    for i in range(600):
-        try:
-            r = httpx.get("http://localhost:8000/health", timeout=2.0)
-            if r.status_code == 200:
-                _log(f"vLLM ready after {i}s")
-                break
-        except Exception:
-            pass
-        time.sleep(1)
-    else:
-        out = proc.stdout.read().decode() if proc.stdout else ""
-        raise RuntimeError(f"vLLM failed to start. Last output:\n{out[-3000:]}")
-
-    # --- Run eval ---
-    client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
-    searchapi_key = os.environ.get("SEARCHAPI_IO_KEY", "")
-    model_dir = model_name.replace("/", "_")
-    output_dir = "/results"
-    total = len(tasks)
-
-    _log(f"Running {total} tasks with {workers} workers")
-
-    results = []
-    start_all = time.time()
-
-    if workers <= 1:
-        for i, task in enumerate(tasks):
-            result = eval_single_task(
-                client=client, model=model_name, task=task,
-                searchapi_key=searchapi_key, output_dir=output_dir,
-                model_dir=model_dir, task_idx=i, total_tasks=total,
-                max_turns=max_turns, max_searches=max_searches,
-                max_browses=max_browses,
-            )
-            results.append(result)
-    else:
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {}
-            for i, task in enumerate(tasks):
-                fut = executor.submit(
-                    eval_single_task,
-                    client=client, model=model_name, task=task,
-                    searchapi_key=searchapi_key, output_dir=output_dir,
-                    model_dir=model_dir, task_idx=i, total_tasks=total,
-                    max_turns=max_turns, max_searches=max_searches,
-                    max_browses=max_browses,
-                )
-                futures[fut] = task["task_id"]
-            for fut in as_completed(futures):
-                results.append(fut.result())
-
-    total_time = time.time() - start_all
-    ok = sum(1 for r in results if r["status"] == "ok")
-    failed = total - ok
-
-    # --- Save summary with per-domain breakdown ---
-    ok_results = [r for r in results if r["status"] == "ok"]
-    domain_stats = {}
-    for r in results:
-        d = r.get("domain", "unknown")
-        if d not in domain_stats:
-            domain_stats[d] = {
-                "completed": 0, "failed": 0,
-                "total_searches": 0, "total_browses": 0,
-                "total_score": 0, "total_hurdle_score": 0, "total_criteria": 0,
-            }
-        if r["status"] == "ok":
-            domain_stats[d]["completed"] += 1
-            domain_stats[d]["total_searches"] += r.get("searches", 0)
-            domain_stats[d]["total_browses"] += r.get("browses", 0)
-            domain_stats[d]["total_score"] += r.get("total_score", 0)
-            domain_stats[d]["total_hurdle_score"] += r.get("total_hurdle_score", 0)
-            domain_stats[d]["total_criteria"] += r.get("num_criteria", 0)
+    try:
+        for i in range(600):
+            try:
+                r = httpx.get("http://localhost:8000/health", timeout=2.0)
+                if r.status_code == 200:
+                    _log(f"vLLM ready after {i}s")
+                    break
+            except Exception:
+                pass
+            time.sleep(1)
         else:
-            domain_stats[d]["failed"] += 1
+            out = proc.stdout.read().decode() if proc.stdout else ""
+            raise RuntimeError(f"vLLM failed to start. Last output:\n{out[-3000:]}")
 
-    summary = {
-        "model": model_name,
-        "total_tasks": total,
-        "completed": ok,
-        "failed": failed,
-        "total_time_seconds": round(total_time, 1),
-        "avg_time_per_task": round(sum(r["elapsed"] for r in ok_results) / ok, 2) if ok else 0,
-        "total_searches": sum(r.get("searches", 0) for r in ok_results),
-        "total_browses": sum(r.get("browses", 0) for r in ok_results),
-        "domain_stats": domain_stats,
-        "results": results,
-    }
+        # --- Run eval ---
+        client = OpenAI(base_url="http://localhost:8000/v1", api_key="not-needed")
+        searchapi_key = os.environ.get("SEARCHAPI_IO_KEY", "")
+        model_dir = model_name.replace("/", "_")
+        if prompt_preset:
+            model_dir = f"{model_dir}_{prompt_preset}"
+        output_dir = "/results"
+        total = len(tasks)
 
-    summary_path = Path(output_dir) / model_dir / "summary.json"
-    summary_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(summary_path, "w") as f:
-        json.dump(summary, f, indent=2)
+        # Expand tasks × runs into work items
+        use_run_id = runs > 1
+        work_items = []
+        for task in tasks:
+            for run_id in range(1, runs + 1):
+                work_items.append((task, run_id if use_run_id else None))
+        total_items = len(work_items)
 
-    results_vol.commit()
-    proc.terminate()
+        _log(
+            f"Running {total} tasks × {runs} runs = {total_items} work items with {workers} workers"
+        )
 
-    _log(f"\n{model_name}: {ok}/{total} completed, {failed} failed, {total_time:.1f}s")
-    return json.dumps(summary)
+        results = []
+        start_all = time.time()
+
+        if workers <= 1:
+            for i, (task, run_id) in enumerate(work_items):
+                result = eval_single_task(
+                    client=client,
+                    model=model_name,
+                    task=task,
+                    searchapi_key=searchapi_key,
+                    output_dir=output_dir,
+                    model_dir=model_dir,
+                    task_idx=i,
+                    total_tasks=total_items,
+                    system_prompt=system_prompt,
+                    max_turns=max_turns,
+                    max_searches=max_searches,
+                    max_browses=max_browses,
+                    run_id=run_id,
+                )
+                results.append(result)
+        else:
+            with ThreadPoolExecutor(max_workers=workers) as executor:
+                futures = {}
+                for i, (task, run_id) in enumerate(work_items):
+                    fut = executor.submit(
+                        eval_single_task,
+                        client=client,
+                        model=model_name,
+                        task=task,
+                        searchapi_key=searchapi_key,
+                        output_dir=output_dir,
+                        model_dir=model_dir,
+                        task_idx=i,
+                        total_tasks=total_items,
+                        system_prompt=system_prompt,
+                        max_turns=max_turns,
+                        max_searches=max_searches,
+                        max_browses=max_browses,
+                        run_id=run_id,
+                    )
+                    futures[fut] = (task["task_id"], run_id)
+                for fut in as_completed(futures):
+                    results.append(fut.result())
+
+        total_time = time.time() - start_all
+        summary = build_eval_summary(model_name, results, total_time)
+        ok = summary["completed"]
+        failed = summary["failed"]
+
+        summary_path = Path(output_dir) / model_dir / "summary.json"
+        summary_path.parent.mkdir(parents=True, exist_ok=True)
+        with open(summary_path, "w") as f:
+            json.dump(summary, f, indent=2)
+
+        results_vol.commit()
+
+        _log(
+            f"\n{model_name}: {ok}/{total} completed, {failed} failed, {total_time:.1f}s"
+        )
+        return json.dumps(summary)
+    finally:
+        proc.terminate()
+        proc.wait(timeout=10)
 
 
 # ---------------------------------------------------------------------------
 # Two GPU tiers (Modal needs static GPU specs at decoration time)
 # ---------------------------------------------------------------------------
 @app.function(
-    image=eval_image, gpu="H100", timeout=7200,
-    secrets=SECRETS, volumes=VOLUMES,
+    image=eval_image,
+    gpu="H100",
+    timeout=7200,
+    secrets=SECRETS,
+    volumes=VOLUMES,
 )
 def eval_1gpu(
-    model_name: str, tasks_json: str, workers: int = 4,
-    max_turns: int = 10, max_searches: int = 5, max_browses: int = 5,
+    model_name: str,
+    tasks_json: str,
+    workers: int = 4,
+    max_turns: int = 10,
+    max_searches: int = 5,
+    max_browses: int = 5,
     judge_model: str = "",
+    prompt_preset: str = "",
+    runs: int = 1,
 ) -> str:
     return _run_eval_inner(
-        model_name, tasks_json, tp_size=1, workers=workers,
-        max_turns=max_turns, max_searches=max_searches, max_browses=max_browses,
+        model_name,
+        tasks_json,
+        tp_size=1,
+        workers=workers,
+        max_turns=max_turns,
+        max_searches=max_searches,
+        max_browses=max_browses,
         judge_model=judge_model,
+        prompt_preset=prompt_preset,
+        runs=runs,
     )
 
 
 @app.function(
-    image=eval_image, gpu="H100:2", timeout=7200,
-    secrets=SECRETS, volumes=VOLUMES,
+    image=eval_image,
+    gpu="H100:2",
+    timeout=7200,
+    secrets=SECRETS,
+    volumes=VOLUMES,
 )
 def eval_2gpu(
-    model_name: str, tasks_json: str, workers: int = 4,
-    max_turns: int = 10, max_searches: int = 5, max_browses: int = 5,
+    model_name: str,
+    tasks_json: str,
+    workers: int = 4,
+    max_turns: int = 10,
+    max_searches: int = 5,
+    max_browses: int = 5,
     judge_model: str = "",
+    prompt_preset: str = "",
+    runs: int = 1,
 ) -> str:
     return _run_eval_inner(
-        model_name, tasks_json, tp_size=2, workers=workers,
-        max_turns=max_turns, max_searches=max_searches, max_browses=max_browses,
+        model_name,
+        tasks_json,
+        tp_size=2,
+        workers=workers,
+        max_turns=max_turns,
+        max_searches=max_searches,
+        max_browses=max_browses,
         judge_model=judge_model,
+        prompt_preset=prompt_preset,
+        runs=runs,
     )
 
 
@@ -289,6 +344,9 @@ def main(
     max_searches: int = 5,
     max_browses: int = 5,
     judge_model: str = "",
+    prompt: str = "",
+    runs: int = 1,
+    shards: int = 1,
 ):
     import pyarrow.parquet as pq
 
@@ -313,13 +371,15 @@ def main(
         reward_model = table.column("reward_model")[i].as_py()
         criteria = json.loads(reward_model.get("ground_truth", "[]"))
         extra_info = table.column("extra_info")[i].as_py()
-        tasks.append({
-            "task_id": extra_info.get("task_id", str(i)),
-            "prompt": prompt_text,
-            "criteria": criteria,
-            "domain": extra_info.get("domain", "unknown"),
-            "shop_vs_product": extra_info.get("shop_vs_product"),
-        })
+        tasks.append(
+            {
+                "task_id": extra_info.get("task_id", str(i)),
+                "prompt": prompt_text,
+                "criteria": criteria,
+                "domain": extra_info.get("domain", "unknown"),
+                "shop_vs_product": extra_info.get("shop_vs_product"),
+            }
+        )
 
     if domains:
         domain_list = [d.strip() for d in domains.split(",")]
@@ -330,38 +390,87 @@ def main(
 
     print(f"Tasks: {len(tasks)}")
     print(f"Models: {[m.split('/')[-1] for m in model_list]}")
-
-    tasks_json = json.dumps(tasks)
+    if shards > 1:
+        print(f"Shards: {shards} (each model gets {shards} GPU containers)")
 
     # Dispatch all models in parallel (each gets its own GPU container)
-    handles = {}
+    # With shards > 1, each model gets N containers with disjoint task subsets
+    spawn_kwargs = dict(
+        workers=workers,
+        max_turns=max_turns,
+        max_searches=max_searches,
+        max_browses=max_browses,
+        judge_model=judge_model,
+        prompt_preset=prompt,
+        runs=runs,
+    )
+
+    # handles: {model: [(shard_idx, handle), ...]}
+    handles: dict[str, list] = {}
     for m in model_list:
         large = _is_large_model(m)
         fn = eval_2gpu if large else eval_1gpu
         gpu_desc = "2xH100" if large else "1xH100"
-        print(f"  Dispatching {m} ({gpu_desc})...")
-        handles[m] = fn.spawn(
-            model_name=m, tasks_json=tasks_json, workers=workers,
-            max_turns=max_turns, max_searches=max_searches, max_browses=max_browses,
-            judge_model=judge_model,
+        handles[m] = []
+
+        if shards > 1:
+            chunks = [(i, tasks[i::shards]) for i in range(shards) if tasks[i::shards]]
+            for shard_idx, chunk in chunks:
+                print(
+                    f"  Dispatching {m} shard {shard_idx + 1}/{shards} ({len(chunk)} tasks, {gpu_desc})..."
+                )
+                h = fn.spawn(model_name=m, tasks_json=json.dumps(chunk), **spawn_kwargs)
+                handles[m].append((shard_idx, h))
+        else:
+            print(f"  Dispatching {m} ({gpu_desc})...")
+            h = fn.spawn(model_name=m, tasks_json=json.dumps(tasks), **spawn_kwargs)
+            handles[m].append((0, h))
+
+    # Collect results as they finish, merging shards per model
+    from ace_eval import build_eval_summary
+
+    all_summaries = {}
+    for m, shard_handles in handles.items():
+        n_shards = len(shard_handles)
+        print(f"\nWaiting for {m} ({n_shards} shard(s))...")
+
+        all_results = []
+        max_time = 0.0
+        for shard_idx, handle in sorted(shard_handles):
+            try:
+                summary_json = handle.get()
+                summary = json.loads(summary_json)
+                all_results.extend(summary.get("results", []))
+                max_time = max(max_time, summary.get("total_time_seconds", 0))
+                print(
+                    f"  Shard {shard_idx + 1}: {summary['completed']}/{summary['total_tasks']} completed "
+                    f"in {summary['total_time_seconds']}s"
+                )
+            except Exception as e:
+                print(f"  Shard {shard_idx + 1}: FAILED: {e}")
+
+        # Build proper merged summary with domain stats, task aggregation, etc.
+        merged = build_eval_summary(m, all_results, max_time)
+        merged["shards"] = n_shards
+        all_summaries[m] = merged
+
+        ok = merged["completed"]
+        failed = merged["failed"]
+        print(
+            f"  Total: {ok}/{len(all_results)} completed, {failed} failed, {max_time:.1f}s wall time"
         )
 
-    # Collect results as they finish
-    all_summaries = {}
-    for m, handle in handles.items():
-        print(f"\nWaiting for {m}...")
-        try:
-            summary_json = handle.get()
-            summary = json.loads(summary_json)
-            all_summaries[m] = summary
-            print(f"  {summary['completed']}/{summary['total_tasks']} completed "
-                  f"in {summary['total_time_seconds']}s")
-        except Exception as e:
-            print(f"  FAILED: {e}")
-            all_summaries[m] = {
-                "model": m, "total_tasks": len(tasks),
-                "completed": 0, "failed": len(tasks),
-                "total_time_seconds": 0, "results": [],
-            }
+        # Write merged summary to volume (overwrites partial per-shard summaries)
+        if n_shards > 1:
+            model_dir = m.replace("/", "_")
+            if prompt:
+                model_dir = f"{model_dir}_{prompt}"
+            summary_path = f"eval_results/{model_dir}/summary.json"
+            try:
+                with open(summary_path, "w") as f:
+                    json.dump(merged, f, indent=2)
+                print(f"  Merged summary written to {summary_path}")
+            except Exception:
+                pass  # local dir may not exist; volume has per-shard copies
 
     print("\nDone.")

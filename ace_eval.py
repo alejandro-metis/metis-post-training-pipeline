@@ -32,9 +32,12 @@ import httpx
 import pyarrow.parquet as pq
 from openai import OpenAI
 
-from ace_grounding_wrapper import build_autograder_input
+from ace_eval_prompts import DEFAULT_PROMPT, get_prompt, list_prompts
+from ace_scoring.jina import extract_title, fetch_page
+from ace_scoring.product import extract_products, map_products_to_sources
 from ace_scoring.scorer import grade_task
-from ace_scoring.sources import enrich_snippet_sources
+from ace_scoring.sources import enrich_snippet_sources, sources_from_tool_history
+from ace_scoring.types import format_criteria_for_autograder
 
 # Tool definitions for the model (OpenAI function calling format)
 TOOLS = [
@@ -80,53 +83,7 @@ TOOLS = [
     },
 ]
 
-SYSTEM_PROMPT = """You are a helpful shopping and recommendation assistant with access to web search and page browsing tools.
-
-You have two tools:
-- web_search(query): Search the web. Returns titles, snippets, and URLs.
-- browse_page(url): Read the full content of a web page.
-
-CRITICAL RULES:
-1. You MUST browse at least 2-3 pages before giving recommendations. Search snippets are NOT enough — they are often outdated or incomplete.
-2. NEVER include a link you haven't verified by browsing. If browse_page fails or returns an error/login wall, do NOT use that link.
-3. NEVER invent or guess prices, features, or availability. Only state facts you read directly from a browsed page.
-4. Prefer direct product/purchase links (e.g., Amazon, store pages). Avoid linking to review articles unless the user asked for reviews.
-5. If you cannot find a working link for a product, say so — do not fabricate one.
-
-WORKFLOW for every request:
-1. Search the web to find relevant results
-2. Browse the most promising pages (at least 2-3) to read actual content, verify links work, and get real details
-3. If a page fails to load or requires login, try a different result
-4. Provide recommendations using ONLY facts from pages you successfully browsed — with exact product names, real prices from the page, and direct working links
-
-Here is an example of a good interaction:
-
-User: I need a budget mechanical keyboard for programming under $50.
-Assistant: [calls web_search(query="best budget mechanical keyboard under $50 2024")]
-Tool result: 1. Best Budget Mechanical Keyboards - RTINGS.com
-   The Redragon K552 and Royal Kludge RK61 are top picks under $50...
-   URL: https://www.rtings.com/keyboard/reviews/best/budget
-   2. Redragon K552 on Amazon - $29.99
-   URL: https://www.amazon.com/dp/B016MAK38U
-Assistant: [calls browse_page(url="https://www.amazon.com/dp/B016MAK38U")]
-Tool result: Page content: Redragon K552 KUMARA Mechanical Gaming Keyboard - $29.99 - Outemu Red switches, TKL layout, RGB backlighting, 4.5 stars...
-Assistant: [calls browse_page(url="https://www.rtings.com/keyboard/reviews/best/budget")]
-Tool result: Page content: ...The Redragon K552 is our top budget pick. Royal Kludge RK61 ($39.99) is best for compact wireless...
-Assistant: Based on my research, here are my top recommendations:
-
-1. **Redragon K552 KUMARA** - $29.99
-   - Outemu Red mechanical switches
-   - Compact TKL (tenkeyless) layout, RGB backlighting
-   - 4.5/5 stars on Amazon
-   - Buy link: https://www.amazon.com/dp/B016MAK38U
-
-2. **Royal Kludge RK61** - $39.99
-   ...
-
-Now respond to the user's actual request below."""
-
 SEARCHAPI_BASE = "https://www.searchapi.io/api/v1/search"
-JINA_READER_BASE = "https://r.jina.ai"
 
 _print_lock = Lock()
 
@@ -136,7 +93,9 @@ def _log(msg: str):
         print(msg, flush=True)
 
 
-def execute_web_search(query: str, api_key: str, max_results: int = 5) -> tuple[str, dict]:
+def execute_web_search(
+    query: str, api_key: str, max_results: int = 5
+) -> tuple[str, dict]:
     """Execute a web search via SearchAPI.io.
 
     Returns (formatted_text, raw_data).
@@ -144,7 +103,12 @@ def execute_web_search(query: str, api_key: str, max_results: int = 5) -> tuple[
     try:
         resp = httpx.get(
             SEARCHAPI_BASE,
-            params={"q": query, "engine": "google", "api_key": api_key, "num": max_results},
+            params={
+                "q": query,
+                "engine": "google",
+                "api_key": api_key,
+                "num": max_results,
+            },
             timeout=15.0,
         )
         resp.raise_for_status()
@@ -156,7 +120,9 @@ def execute_web_search(query: str, api_key: str, max_results: int = 5) -> tuple[
 
         parts = []
         for i, r in enumerate(organic, 1):
-            parts.append(f"{i}. {r.get('title', '')}\n   {r.get('snippet', '')}\n   URL: {r.get('link', '')}")
+            parts.append(
+                f"{i}. {r.get('title', '')}\n   {r.get('snippet', '')}\n   URL: {r.get('link', '')}"
+            )
 
         return "Search Results:\n" + "\n\n".join(parts), data
 
@@ -169,31 +135,17 @@ def execute_browse_page(url: str, max_chars: int = 8000) -> tuple[str, dict]:
 
     Returns (formatted_text, page_data).
     """
-    try:
-        resp = httpx.get(
-            f"{JINA_READER_BASE}/{url}",
-            headers={"Accept": "text/markdown"},
-            timeout=20.0,
-        )
-        resp.raise_for_status()
-        markdown = resp.text
+    markdown, err = fetch_page(url, timeout=20.0, max_chars=200000)
+    if err:
+        return f"Failed to load page: {err}", {}
 
-        title = url
-        for line in markdown.split("\n"):
-            line = line.strip()
-            if line.startswith("# "):
-                title = line[2:].strip()
-                break
+    title = extract_title(markdown, fallback=url)
+    truncated = markdown[:max_chars]
+    if len(markdown) > max_chars:
+        truncated += "\n\n[Content truncated]"
 
-        truncated = markdown[:max_chars]
-        if len(markdown) > max_chars:
-            truncated += "\n\n[Content truncated]"
-
-        page_data = {"url": url, "title": title, "markdown": markdown}
-        return f"Page content from {url}:\n\n{truncated}", page_data
-
-    except Exception as e:
-        return f"Failed to load page: {e}", {}
+    page_data = {"url": url, "title": title, "markdown": markdown}
+    return f"Page content from {url}:\n\n{truncated}", page_data
 
 
 def run_agent_loop(
@@ -201,6 +153,7 @@ def run_agent_loop(
     model: str,
     prompt: str,
     searchapi_key: str,
+    system_prompt: str = "",
     max_turns: int = 10,
     max_searches: int = 5,
     max_browses: int = 5,
@@ -209,8 +162,10 @@ def run_agent_loop(
 
     Returns (response_text, tool_history).
     """
+    if not system_prompt:
+        system_prompt = get_prompt(DEFAULT_PROMPT)
     messages = [
-        {"role": "system", "content": SYSTEM_PROMPT},
+        {"role": "system", "content": system_prompt},
         {"role": "user", "content": prompt},
     ]
 
@@ -247,10 +202,12 @@ def run_agent_loop(
                     args.get("query", ""), searchapi_key
                 )
                 if raw_data:
-                    tool_history["searches"].append({
-                        "query": args.get("query", ""),
-                        "results": raw_data,
-                    })
+                    tool_history["searches"].append(
+                        {
+                            "query": args.get("query", ""),
+                            "results": raw_data,
+                        }
+                    )
                     search_count += 1
                 _log(f"  [search #{search_count}] {args.get('query', '')}")
 
@@ -268,11 +225,13 @@ def run_agent_loop(
             else:
                 result_text = f"Unknown tool: {fn_name}"
 
-            messages.append({
-                "role": "tool",
-                "tool_call_id": tool_call.id,
-                "content": result_text,
-            })
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,
+                    "content": result_text,
+                }
+            )
 
     # Max turns reached — return whatever we have
     last_msg = messages[-1]
@@ -297,13 +256,15 @@ def load_tasks_from_parquet(parquet_path: str) -> list[dict]:
 
         extra_info = table.column("extra_info")[i].as_py()
 
-        tasks.append({
-            "task_id": extra_info.get("task_id", str(i)),
-            "prompt": prompt_text,
-            "criteria": criteria,
-            "domain": extra_info.get("domain", "unknown"),
-            "shop_vs_product": extra_info.get("shop_vs_product"),
-        })
+        tasks.append(
+            {
+                "task_id": extra_info.get("task_id", str(i)),
+                "prompt": prompt_text,
+                "criteria": criteria,
+                "domain": extra_info.get("domain", "unknown"),
+                "shop_vs_product": extra_info.get("shop_vs_product"),
+            }
+        )
 
     return tasks
 
@@ -317,17 +278,21 @@ def eval_single_task(
     model_dir: str,
     task_idx: int,
     total_tasks: int,
+    system_prompt: str = "",
     max_turns: int = 10,
     max_searches: int = 5,
     max_browses: int = 5,
+    run_id: int | None = None,
 ) -> dict:
     """Evaluate a single ACE task. Thread-safe.
 
     Returns a result dict with task_id, domain, status, elapsed, etc.
+    If run_id is set, results go into task_{id}/run_{run_id}/ subdirectory.
     """
     task_id = task["task_id"]
     domain = task["domain"]
-    _log(f"\n[{task_idx+1}/{total_tasks}] Task {task_id} ({domain})")
+    run_label = f" run {run_id}" if run_id is not None else ""
+    _log(f"\n[{task_idx + 1}/{total_tasks}] Task {task_id} ({domain}){run_label}")
 
     start = time.time()
 
@@ -337,6 +302,7 @@ def eval_single_task(
             model=model,
             prompt=task["prompt"],
             searchapi_key=searchapi_key,
+            system_prompt=system_prompt,
             max_turns=max_turns,
             max_searches=max_searches,
             max_browses=max_browses,
@@ -345,21 +311,44 @@ def eval_single_task(
         elapsed = time.time() - start
         n_searches = len(tool_history["searches"])
         n_browses = len(tool_history["browsed_pages"])
-        _log(f"  Task {task_id}: {len(response_text)} chars, {n_searches} searches, {n_browses} browses ({elapsed:.1f}s)")
-
-        # Build autograder-compatible JSON
-        autograder_input = build_autograder_input(
-            task_id=task_id,
-            query=task["prompt"],
-            response_text=response_text,
-            criteria=task["criteria"],
-            tool_history=tool_history,
-            domain=domain,
-            shop_vs_product=task.get("shop_vs_product"),
+        _log(
+            f"  Task {task_id}: {len(response_text)} chars, {n_searches} searches, {n_browses} browses ({elapsed:.1f}s)"
         )
 
-        # Save all artifacts per task
-        out_dir = Path(output_dir) / model_dir / domain / f"task_{task_id}"
+        # Build autograder-compatible JSON (inlined from ace_grounding_wrapper)
+        from datetime import datetime
+
+        sources = sources_from_tool_history(tool_history)
+        product_names = extract_products(response_text, task["prompt"])
+        product_source_map = map_products_to_sources(product_names, sources)
+        formatted_criteria = format_criteria_for_autograder(task["criteria"])
+
+        autograder_input = {
+            "task_id": task_id,
+            "query": task["prompt"],
+            "responseText": response_text,
+            "provider": "custom",
+            "productSourceMap": product_source_map,
+            "criteria": formatted_criteria,
+            "sources": sources,
+            "failed_grounded_sites": [],
+            "metadata": {
+                "total_sources": len(sources),
+                "scraped_at": datetime.now().isoformat(),
+                "failed_scrapes": 0,
+            },
+            "pipeline_timing": {
+                "total_seconds": 0.0,
+                "scraping_seconds": 0.0,
+                "processing_seconds": 0.0,
+            },
+        }
+        if task.get("shop_vs_product") and domain.lower() == "shopping":
+            autograder_input["shop_vs_product"] = task["shop_vs_product"]
+
+        # Save all artifacts per task (nested under run_id when multiple runs)
+        task_dir = Path(output_dir) / model_dir / domain / f"task_{task_id}"
+        out_dir = task_dir / f"run_{run_id}" if run_id is not None else task_dir
         out_dir.mkdir(parents=True, exist_ok=True)
 
         # 1. Autograder input (what the ACE autograder expects)
@@ -375,8 +364,7 @@ def eval_single_task(
         # 3. Score: run the scorer to produce 3_autograder_results.json
         # Pass products from autograder_input to avoid double LLM extraction
         existing_products = [
-            p["product_name"]
-            for p in autograder_input.get("productSourceMap", [])
+            p["product_name"] for p in autograder_input.get("productSourceMap", [])
         ]
         score_result = grade_task(
             task_id=task_id,
@@ -384,7 +372,7 @@ def eval_single_task(
             criteria=task["criteria"],
             sources=autograder_input["sources"],
             product_source_map=autograder_input.get("productSourceMap"),
-            products=existing_products or None,
+            products=existing_products if existing_products is not None else None,
             query=task["prompt"],
             domain=domain,
             shop_vs_product=task.get("shop_vs_product", "Product"),
@@ -427,10 +415,12 @@ def eval_single_task(
         with open(out_dir / "trace.json", "w") as f:
             json.dump(trace, f, indent=2, ensure_ascii=False)
 
-        _log(f"  Task {task_id}: score={score_result.total_score}/{score_result.num_criteria} "
-             f"hurdle={score_result.total_hurdle_score} | saved {out_dir}")
+        _log(
+            f"  Task {task_id}: score={score_result.total_score}/{score_result.num_criteria} "
+            f"hurdle={score_result.total_hurdle_score} | saved {out_dir}"
+        )
 
-        return {
+        result = {
             "task_id": task_id,
             "domain": domain,
             "status": "ok",
@@ -442,16 +432,100 @@ def eval_single_task(
             "total_hurdle_score": score_result.total_hurdle_score,
             "num_criteria": score_result.num_criteria,
         }
+        if run_id is not None:
+            result["run_id"] = run_id
+        return result
 
     except Exception as e:
         elapsed = time.time() - start
         _log(f"  Task {task_id}: FAILED ({e})")
-        return {
+        result = {
             "task_id": task_id,
             "domain": domain,
             "status": f"error: {e}",
             "elapsed": elapsed,
         }
+        if run_id is not None:
+            result["run_id"] = run_id
+        return result
+
+
+def build_eval_summary(model: str, results: list[dict], total_time: float) -> dict:
+    """Build eval summary with per-domain breakdown. Shared by local and Modal eval.
+
+    When results include run_id (multiple runs per task), adds per-task
+    aggregation with mean/std scores.
+    """
+    ok_results = [r for r in results if r["status"] == "ok"]
+    ok = len(ok_results)
+    failed = len(results) - ok
+
+    domain_stats = {}
+    for r in results:
+        d = r.get("domain", "unknown")
+        if d not in domain_stats:
+            domain_stats[d] = {
+                "completed": 0,
+                "failed": 0,
+                "total_searches": 0,
+                "total_browses": 0,
+                "total_score": 0,
+                "total_hurdle_score": 0,
+                "total_criteria": 0,
+            }
+        if r["status"] == "ok":
+            domain_stats[d]["completed"] += 1
+            domain_stats[d]["total_searches"] += r.get("searches", 0)
+            domain_stats[d]["total_browses"] += r.get("browses", 0)
+            domain_stats[d]["total_score"] += r.get("total_score", 0)
+            domain_stats[d]["total_hurdle_score"] += r.get("total_hurdle_score", 0)
+            domain_stats[d]["total_criteria"] += r.get("num_criteria", 0)
+        else:
+            domain_stats[d]["failed"] += 1
+
+    summary = {
+        "model": model,
+        "total_tasks": len(results),
+        "completed": ok,
+        "failed": failed,
+        "total_time_seconds": round(total_time, 1),
+        "avg_time_per_task": round(sum(r["elapsed"] for r in ok_results) / ok, 2)
+        if ok
+        else 0,
+        "total_searches": sum(r.get("searches", 0) for r in ok_results),
+        "total_browses": sum(r.get("browses", 0) for r in ok_results),
+        "domain_stats": domain_stats,
+        "results": results,
+    }
+
+    # Per-task aggregation across runs (mean/std)
+    has_runs = any("run_id" in r for r in results)
+    if has_runs:
+        from collections import defaultdict
+        import statistics
+
+        by_task: dict[str, list[dict]] = defaultdict(list)
+        for r in ok_results:
+            by_task[str(r["task_id"])].append(r)
+
+        task_agg = {}
+        for tid, runs in sorted(by_task.items()):
+            scores = [r["total_score"] for r in runs]
+            hurdle_scores = [r["total_hurdle_score"] for r in runs]
+            task_agg[tid] = {
+                "domain": runs[0]["domain"],
+                "num_criteria": runs[0]["num_criteria"],
+                "num_runs": len(runs),
+                "scores": scores,
+                "mean_score": round(statistics.mean(scores), 2),
+                "std_score": round(statistics.stdev(scores), 2)
+                if len(scores) > 1
+                else 0.0,
+                "mean_hurdle_score": round(statistics.mean(hurdle_scores), 2),
+            }
+        summary["task_aggregation"] = task_agg
+
+    return summary
 
 
 def run_eval_for_model(
@@ -465,45 +539,81 @@ def run_eval_for_model(
     max_turns: int,
     max_searches: int,
     max_browses: int,
+    system_prompt: str = "",
+    prompt_name: str = "",
+    runs: int = 1,
 ) -> list[dict]:
-    """Run eval for a single model across all tasks, with parallel workers."""
-    model_dir = model.replace("/", "_")
-    client = OpenAI(api_key=api_key, base_url=api_base)
-    total = len(tasks)
+    """Run eval for a single model across all tasks, with parallel workers.
 
-    _log(f"\n{'='*60}")
+    When runs > 1, each task is evaluated multiple times. Results are stored
+    in task_{id}/run_{n}/ subdirectories and the summary includes per-task
+    mean/std aggregation.
+    """
+    model_dir = model.replace("/", "_")
+    if prompt_name:
+        model_dir = f"{model_dir}_{prompt_name}"
+    client = OpenAI(api_key=api_key, base_url=api_base)
+
+    # Expand tasks × runs into work items
+    use_run_id = runs > 1
+    work_items = []
+    for task in tasks:
+        for run_id in range(1, runs + 1):
+            work_items.append((task, run_id if use_run_id else None))
+
+    total = len(work_items)
+
+    _log(f"\n{'=' * 60}")
     _log(f"Model: {model}")
-    _log(f"Tasks: {total}, Workers: {workers}")
-    _log(f"{'='*60}")
+    _log(
+        f"Tasks: {len(tasks)}, Runs: {runs}, Total work items: {total}, Workers: {workers}"
+    )
+    _log(f"{'=' * 60}")
 
     results = []
     start_all = time.time()
 
     if workers <= 1:
         # Sequential
-        for i, task in enumerate(tasks):
+        for i, (task, run_id) in enumerate(work_items):
             result = eval_single_task(
-                client=client, model=model, task=task,
-                searchapi_key=searchapi_key, output_dir=output_dir,
-                model_dir=model_dir, task_idx=i, total_tasks=total,
-                max_turns=max_turns, max_searches=max_searches,
+                client=client,
+                model=model,
+                task=task,
+                searchapi_key=searchapi_key,
+                output_dir=output_dir,
+                model_dir=model_dir,
+                task_idx=i,
+                total_tasks=total,
+                system_prompt=system_prompt,
+                max_turns=max_turns,
+                max_searches=max_searches,
                 max_browses=max_browses,
+                run_id=run_id,
             )
             results.append(result)
     else:
         # Parallel
         with ThreadPoolExecutor(max_workers=workers) as executor:
             futures = {}
-            for i, task in enumerate(tasks):
+            for i, (task, run_id) in enumerate(work_items):
                 fut = executor.submit(
                     eval_single_task,
-                    client=client, model=model, task=task,
-                    searchapi_key=searchapi_key, output_dir=output_dir,
-                    model_dir=model_dir, task_idx=i, total_tasks=total,
-                    max_turns=max_turns, max_searches=max_searches,
+                    client=client,
+                    model=model,
+                    task=task,
+                    searchapi_key=searchapi_key,
+                    output_dir=output_dir,
+                    model_dir=model_dir,
+                    task_idx=i,
+                    total_tasks=total,
+                    system_prompt=system_prompt,
+                    max_turns=max_turns,
+                    max_searches=max_searches,
                     max_browses=max_browses,
+                    run_id=run_id,
                 )
-                futures[fut] = task["task_id"]
+                futures[fut] = (task["task_id"], run_id)
 
             for fut in as_completed(futures):
                 results.append(fut.result())
@@ -519,41 +629,9 @@ def run_eval_for_model(
         avg_time = sum(r["elapsed"] for r in results if r["status"] == "ok") / ok
         _log(f"  Avg time per task: {avg_time:.1f}s")
 
-    # Write summary JSON with per-domain breakdown
-    ok_results = [r for r in results if r["status"] == "ok"]
-    domain_stats = {}
-    for r in results:
-        d = r.get("domain", "unknown")
-        if d not in domain_stats:
-            domain_stats[d] = {
-                "completed": 0, "failed": 0,
-                "total_searches": 0, "total_browses": 0,
-                "total_score": 0, "total_hurdle_score": 0, "total_criteria": 0,
-            }
-        if r["status"] == "ok":
-            domain_stats[d]["completed"] += 1
-            domain_stats[d]["total_searches"] += r.get("searches", 0)
-            domain_stats[d]["total_browses"] += r.get("browses", 0)
-            domain_stats[d]["total_score"] += r.get("total_score", 0)
-            domain_stats[d]["total_hurdle_score"] += r.get("total_hurdle_score", 0)
-            domain_stats[d]["total_criteria"] += r.get("num_criteria", 0)
-        else:
-            domain_stats[d]["failed"] += 1
-
+    summary = build_eval_summary(model, results, total_time)
     summary_path = Path(output_dir) / model_dir / "summary.json"
     summary_path.parent.mkdir(parents=True, exist_ok=True)
-    summary = {
-        "model": model,
-        "total_tasks": total,
-        "completed": ok,
-        "failed": failed,
-        "total_time_seconds": round(total_time, 1),
-        "avg_time_per_task": round(sum(r["elapsed"] for r in ok_results) / ok, 2) if ok else 0,
-        "total_searches": sum(r.get("searches", 0) for r in ok_results),
-        "total_browses": sum(r.get("browses", 0) for r in ok_results),
-        "domain_stats": domain_stats,
-        "results": results,
-    }
     with open(summary_path, "w") as f:
         json.dump(summary, f, indent=2)
     _log(f"  Summary: {summary_path}")
@@ -567,25 +645,75 @@ def main():
     # Model(s) — support both --model and --models
     model_group = parser.add_mutually_exclusive_group(required=True)
     model_group.add_argument("--model", help="Single model name")
-    model_group.add_argument("--models", nargs="+", help="Multiple model names for baseline comparison")
+    model_group.add_argument(
+        "--models", nargs="+", help="Multiple model names for baseline comparison"
+    )
 
-    parser.add_argument("--api_base", default="https://api.openai.com/v1", help="OpenAI-compatible API base URL")
-    parser.add_argument("--api_key", default=None, help="API key (defaults to OPENAI_API_KEY env var)")
-    parser.add_argument("--searchapi_key", default=None, help="SearchAPI.io key (defaults to SEARCHAPI_IO_KEY env var)")
-    parser.add_argument("--parquet", default="ace_verl_data/test.parquet", help="Path to ACE parquet file")
+    parser.add_argument(
+        "--api_base",
+        default="https://api.openai.com/v1",
+        help="OpenAI-compatible API base URL",
+    )
+    parser.add_argument(
+        "--api_key", default=None, help="API key (defaults to OPENAI_API_KEY env var)"
+    )
+    parser.add_argument(
+        "--searchapi_key",
+        default=None,
+        help="SearchAPI.io key (defaults to SEARCHAPI_IO_KEY env var)",
+    )
+    parser.add_argument(
+        "--parquet",
+        default="ace_verl_data/test.parquet",
+        help="Path to ACE parquet file",
+    )
     parser.add_argument("--output_dir", default="eval_results", help="Output directory")
-    parser.add_argument("--domains", nargs="+", default=None, help="Filter by domain (e.g. shopping food)")
+    parser.add_argument(
+        "--domains",
+        nargs="+",
+        default=None,
+        help="Filter by domain (e.g. shopping food)",
+    )
     parser.add_argument("--task_ids", nargs="+", default=None, help="Filter by task ID")
-    parser.add_argument("--max_turns", type=int, default=10, help="Max agent loop turns per task")
-    parser.add_argument("--max_searches", type=int, default=5, help="Max searches per task")
-    parser.add_argument("--max_browses", type=int, default=5, help="Max browses per task")
-    parser.add_argument("--workers", type=int, default=1, help="Parallel workers per model (default: 1 = sequential)")
-    parser.add_argument("--judge_model", default=None, help="OpenAI model for autograder judge (default: gpt-4o, or ACE_JUDGE_MODEL env)")
+    parser.add_argument(
+        "--max_turns", type=int, default=10, help="Max agent loop turns per task"
+    )
+    parser.add_argument(
+        "--max_searches", type=int, default=5, help="Max searches per task"
+    )
+    parser.add_argument(
+        "--max_browses", type=int, default=5, help="Max browses per task"
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=1,
+        help="Parallel workers per model (default: 1 = sequential)",
+    )
+    parser.add_argument(
+        "--judge_model",
+        default=None,
+        help="OpenAI model for autograder judge (default: gpt-4o, or ACE_JUDGE_MODEL env)",
+    )
+    parser.add_argument(
+        "--prompt",
+        default=DEFAULT_PROMPT,
+        help=f"System prompt preset ({', '.join(list_prompts())}). Default: {DEFAULT_PROMPT}",
+    )
+    parser.add_argument(
+        "--runs",
+        type=int,
+        default=1,
+        help="Number of runs per task (default: 1). Use >1 for variance estimation.",
+    )
     args = parser.parse_args()
 
     # Set judge model via env var so ace_scoring.llm picks it up
     if args.judge_model:
         os.environ["ACE_JUDGE_MODEL"] = args.judge_model
+
+    system_prompt = get_prompt(args.prompt)
+    _log(f"Prompt preset: {args.prompt}")
 
     api_key = args.api_key or os.environ.get("OPENAI_API_KEY", "")
     searchapi_key = args.searchapi_key or os.environ.get("SEARCHAPI_IO_KEY", "")
@@ -607,11 +735,19 @@ def main():
     all_results = {}
     for model in models:
         results = run_eval_for_model(
-            model=model, tasks=tasks,
-            api_base=args.api_base, api_key=api_key,
-            searchapi_key=searchapi_key, output_dir=args.output_dir,
-            workers=args.workers, max_turns=args.max_turns,
-            max_searches=args.max_searches, max_browses=args.max_browses,
+            model=model,
+            tasks=tasks,
+            api_base=args.api_base,
+            api_key=api_key,
+            searchapi_key=searchapi_key,
+            output_dir=args.output_dir,
+            workers=args.workers,
+            max_turns=args.max_turns,
+            max_searches=args.max_searches,
+            max_browses=args.max_browses,
+            system_prompt=system_prompt,
+            prompt_name=args.prompt,
+            runs=args.runs,
         )
         all_results[model] = results
 

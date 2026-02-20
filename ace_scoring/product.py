@@ -40,7 +40,9 @@ def map_products_to_sources(
         title = src.get("source_title", "")
         link = src.get("source_link", "")
         content_preview = src.get("webpage_content", {}).get("markdown", "")[:200]
-        source_descriptions.append(f"  Source {i}: [{title}] {link}\n    {content_preview}")
+        source_descriptions.append(
+            f"  Source {i}: [{title}] {link}\n    {content_preview}"
+        )
 
     prompt = prompts.MAP_PRODUCTS_TO_SOURCES.format(
         product_names=json.dumps(product_names),

@@ -18,13 +18,13 @@ from uuid import uuid4
 
 import httpx
 
+from ace_scoring.jina import JINA_READER_BASE, extract_title
 from verl.tools.base_tool import BaseTool
 from verl.tools.schemas import OpenAIFunctionToolSchema, ToolResponse
 
 logger = logging.getLogger(__name__)
 
 SEARCHAPI_BASE = "https://www.searchapi.io/api/v1/search"
-JINA_READER_BASE = "https://r.jina.ai"
 MAX_RESULTS = 5
 MAX_SEARCHES_PER_ROLLOUT = 5
 MAX_BROWSES_PER_ROLLOUT = 5
@@ -40,8 +40,8 @@ def get_trajectory_state(instance_id: str) -> dict:
     """Get or create shared state for a trajectory."""
     if instance_id not in _trajectory_state:
         _trajectory_state[instance_id] = {
-            "searches": [],      # [{query, results}]
-            "browsed_pages": [], # [{url, title, markdown}]
+            "searches": [],  # [{query, results}]
+            "browsed_pages": [],  # [{url, title, markdown}]
             "search_count": 0,
             "browse_count": 0,
         }
@@ -74,7 +74,9 @@ class AceSearchTool(BaseTool):
         super().__init__(config, tool_schema)
         self._api_key = config.get("api_key") or os.environ.get("SEARCHAPI_IO_KEY", "")
         self._max_results = config.get("max_results", MAX_RESULTS)
-        self._max_searches = config.get("max_searches_per_rollout", MAX_SEARCHES_PER_ROLLOUT)
+        self._max_searches = config.get(
+            "max_searches_per_rollout", MAX_SEARCHES_PER_ROLLOUT
+        )
 
     def get_openai_tool_schema(self) -> OpenAIFunctionToolSchema:
         return self.tool_schema
@@ -95,7 +97,9 @@ class AceSearchTool(BaseTool):
 
         if state["search_count"] >= self._max_searches:
             return (
-                ToolResponse(text="Search limit reached. Use the information you already have."),
+                ToolResponse(
+                    text="Search limit reached. Use the information you already have."
+                ),
                 0.0,
                 {"search_limited": True},
             )
@@ -169,7 +173,9 @@ class AceBrowseTool(BaseTool):
 
     def __init__(self, config: dict, tool_schema: OpenAIFunctionToolSchema):
         super().__init__(config, tool_schema)
-        self._max_browses = config.get("max_browses_per_rollout", MAX_BROWSES_PER_ROLLOUT)
+        self._max_browses = config.get(
+            "max_browses_per_rollout", MAX_BROWSES_PER_ROLLOUT
+        )
         self._timeout = config.get("timeout", 20.0)
         self._max_content_chars = config.get("max_content_chars", 8000)
 
@@ -192,7 +198,9 @@ class AceBrowseTool(BaseTool):
 
         if state["browse_count"] >= self._max_browses:
             return (
-                ToolResponse(text="Browse limit reached. Use the information you already have."),
+                ToolResponse(
+                    text="Browse limit reached. Use the information you already have."
+                ),
                 0.0,
                 {"browse_limited": True},
             )
@@ -207,13 +215,7 @@ class AceBrowseTool(BaseTool):
                 resp.raise_for_status()
                 markdown = resp.text
 
-            # Extract title from first markdown heading if present
-            title = url
-            for line in markdown.split("\n"):
-                line = line.strip()
-                if line.startswith("# "):
-                    title = line[2:].strip()
-                    break
+            title = extract_title(markdown, fallback=url)
 
             # Truncate to avoid blowing up context
             truncated = markdown[: self._max_content_chars]
@@ -221,11 +223,13 @@ class AceBrowseTool(BaseTool):
                 truncated += "\n\n[Content truncated]"
 
             # Store full content for grounding wrapper (not truncated)
-            state["browsed_pages"].append({
-                "url": url,
-                "title": title,
-                "markdown": markdown,
-            })
+            state["browsed_pages"].append(
+                {
+                    "url": url,
+                    "title": title,
+                    "markdown": markdown,
+                }
+            )
             state["browse_count"] += 1
 
             return (

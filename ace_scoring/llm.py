@@ -5,7 +5,13 @@ import os
 import threading
 import time
 
-from openai import OpenAI
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    InternalServerError,
+    OpenAI,
+    RateLimitError,
+)
 
 _client: OpenAI | None = None
 _client_lock = threading.Lock()
@@ -13,11 +19,12 @@ _client_lock = threading.Lock()
 MAX_RETRIES = 3
 RETRY_BACKOFF = 1.0  # seconds, doubles each retry
 
+# Transient errors worth retrying (auth, bad request, etc. should fail immediately)
+_RETRYABLE = (RateLimitError, APIConnectionError, APITimeoutError, InternalServerError)
+
 
 def get_client() -> OpenAI:
     global _client
-    if _client is not None:
-        return _client
     with _client_lock:
         if _client is None:
             _client = OpenAI(api_key=os.environ["OPENAI_API_KEY"])
@@ -36,18 +43,29 @@ def call_judge(prompt: str, model: str | None = None, temperature: float = 0.0) 
                 temperature=temperature,
                 messages=[{"role": "user", "content": prompt}],
             )
-            return resp.choices[0].message.content.strip()
-        except Exception as e:
+            content = resp.choices[0].message.content or ""
+            return content.strip()
+        except _RETRYABLE as e:
             if attempt == MAX_RETRIES - 1:
                 raise
-            # Retry on transient errors (rate limit, server errors)
-            wait = RETRY_BACKOFF * (2 ** attempt)
-            print(f"[ace_scoring] LLM call failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}. Retrying in {wait}s...")
+            wait = RETRY_BACKOFF * (2**attempt)
+            print(
+                f"[ace_scoring] LLM call failed (attempt {attempt + 1}/{MAX_RETRIES}): {e}. Retrying in {wait}s..."
+            )
             time.sleep(wait)
+
+    raise RuntimeError("Unreachable: all retries exhausted")
 
 
 def parse_json(text: str):
     """Extract JSON from LLM response (handles ```json fences)."""
+    # Try raw parse first (most common case)
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        pass
+    # Extract from code fences
     if "```json" in text:
         text = text.split("```json")[1].split("```")[0].strip()
     elif "```" in text:

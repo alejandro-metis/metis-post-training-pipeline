@@ -26,7 +26,9 @@ def compute_reward(
     Normalized: total_score / num_criteria.
     Hurdle gate: any hurdle <= 0 -> 0.0.
     """
-    result = compute_reward_structured(data_source, solution_str, ground_truth, extra_info)
+    result = compute_reward_structured(
+        data_source, solution_str, ground_truth, extra_info
+    )
     return result.to_reward(normalize=True)
 
 
@@ -62,12 +64,21 @@ def compute_reward_structured(
     tool_history = extra_info.get("tool_history")
     sources = sources_from_tool_history(tool_history) if tool_history else []
 
-    return grade_task(
-        task_id=extra_info.get("task_id", "unknown"),
-        response_text=solution_str,
-        criteria=criteria,
-        sources=sources,
-        product_source_map=None,
-        query=extra_info.get("prompt", ""),
-        domain=extra_info.get("domain", "unknown"),
-    )
+    try:
+        return grade_task(
+            task_id=extra_info.get("task_id", "unknown"),
+            response_text=solution_str,
+            criteria=criteria,
+            sources=sources,
+            product_source_map=None,
+            query=extra_info.get("prompt", ""),
+            domain=extra_info.get("domain", "unknown"),
+            shop_vs_product=extra_info.get("shop_vs_product", "Product"),
+        )
+    except Exception as e:
+        print(
+            f"[ace_reward] grade_task failed for task {extra_info.get('task_id', '?')}: {e}"
+        )
+        return TaskResult(
+            task_id=extra_info.get("task_id", "unknown"), num_criteria=len(criteria)
+        )
