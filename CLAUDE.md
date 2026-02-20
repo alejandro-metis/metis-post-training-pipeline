@@ -178,14 +178,13 @@ CLI flags for `ace_eval_modal.py`:
 - `--parquet` — path to parquet file (default: `ace_verl_data/test.parquet`)
 - `--domains` — filter domains, comma-separated (e.g. `"shopping,food"`)
 - `--task-ids` — filter task IDs, comma-separated
-- `--workers` — parallel workers per model (default: 4)
+- `--workers` — parallel tasks per container (default: auto — 16 for ≤16B models, 12 for >16B). vLLM batches concurrent requests efficiently.
 - `--max-turns` — max agent loop turns (default: 10)
 - `--max-searches` / `--max-browses` — per-task limits (default: 5 each)
 - `--judge-model` — override judge (default: gpt-4o via `ACE_JUDGE_MODEL` env)
-- `--prompt` — system prompt preset: `fewshot` (default) or `zeroshot`
+- `--prompt` — system prompt preset: `fewshot` or `zeroshot` (default)
 - `--runs` — number of runs per task (default: 1). Use >1 for variance estimation. Results stored in `task_{id}/run_{n}/` subdirectories.
 - `--shards` — number of GPU containers per model (default: 1). Each shard loads its own model copy. Only use >1 for large models that saturate a single GPU.
-- `--workers` — parallel tasks per container (default: auto — 16 for ≤16B models, 12 for >16B). vLLM batches concurrent requests efficiently.
 
 GPU auto-sizing: <=16B params → 1xH100, >16B → 2xH100
 

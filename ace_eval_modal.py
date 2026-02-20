@@ -558,16 +558,6 @@ def main(
         id_list = [tid.strip() for tid in task_ids.split(",")]
         tasks = [t for t in tasks if str(t["task_id"]) in id_list]
 
-    # Auto-size workers based on model size if not specified.
-    # Small models (≤16B) leave lots of VRAM headroom → more concurrent sequences.
-    # Large models (>16B) fill VRAM → fewer concurrent sequences.
-    if workers <= 0:
-        any_large = any(_is_large_model(m) for m in model_list)
-        workers = 12 if any_large else 16
-        print(
-            f"Auto-sized workers: {workers} ({'large' if any_large else 'small'} model)"
-        )
-
     print(f"Tasks: {len(tasks)}")
     print(f"Models: {[m.split('/')[-1] for m in model_list]}")
     if shards > 1:
@@ -577,14 +567,21 @@ def main(
     handles: dict[str, object] = {}
     for m in model_list:
         large = _is_large_model(m)
+        # Auto-size workers per model when not specified.
+        # Small models (≤16B) leave lots of VRAM → more concurrent sequences.
+        # Large models (>16B) fill VRAM → fewer concurrent sequences.
+        model_workers = workers if workers > 0 else (12 if large else 16)
         gpu_desc = "2xH100" if large else "1xH100"
-        print(f"  Dispatching {m} via coordinator ({shards} shard(s), {gpu_desc})...")
+        print(
+            f"  Dispatching {m} via coordinator "
+            f"({shards} shard(s), {gpu_desc}, {model_workers} workers)..."
+        )
         h = coordinate_model_eval.spawn(
             model_name=m,
             tasks_json=json.dumps(tasks),
             large=large,
             shards=shards,
-            workers=workers,
+            workers=model_workers,
             max_turns=max_turns,
             max_searches=max_searches,
             max_browses=max_browses,
