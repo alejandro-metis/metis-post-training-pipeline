@@ -177,7 +177,7 @@ def retry_with_backoff(func, max_attempts=MAX_RETRY_ATTEMPTS):
     for attempt in range(max_attempts):
         try:
             return func()
-        except Exception as e:
+        except Exception:
             if attempt < max_attempts - 1:
                 time.sleep(RETRY_BASE_DELAY * (2 ** attempt))
             else:

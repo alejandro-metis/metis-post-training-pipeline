@@ -106,7 +106,7 @@ except Exception as e:
     sys.exit(1)
 
 # Parse to normalized format
-print(f"Parsing response to normalized format...")
+print("Parsing response to normalized format...")
 grounding_json = provider.parse_response(raw_response, model_name)
 print(f"✅ Parsed {len(grounding_json.get('groundingChunks', []))} chunks, {len(grounding_json.get('groundingSupports', []))} supports")
 
@@ -115,7 +115,7 @@ grounding_json['query'] = query
 grounding_json['model'] = model_name
 grounding_json['provider'] = provider_name
 
-print(f"✅ Response received!\n")
+print("✅ Response received!\n")
 print("=" * 80)
 print(grounding_json['responseText'])
 print("=" * 80)

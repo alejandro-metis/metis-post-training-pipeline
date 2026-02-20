@@ -4,7 +4,7 @@ Requires API keys (e.g. OPENAI_API_KEY) and a virtual env.
 """
 
 import logging
-from generation import Attachment, GenerationTask, ModelConfig, run_generation_task
+from generation import GenerationTask, ModelConfig, run_generation_task
 from grading import GradingTask, GradingModelConfig, run_grading_task
 from dotenv import load_dotenv
 

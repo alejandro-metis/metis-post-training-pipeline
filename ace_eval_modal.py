@@ -82,6 +82,16 @@ eval_image = (
     .add_local_dir("ace_scoring", "/root/ace_scoring")
 )
 
+# Lightweight image for coordinator (no GPU, no vLLM)
+# pip_install must come before add_local_* per Modal requirements
+coord_image = (
+    modal.Image.debian_slim(python_version="3.11")
+    .pip_install("openai", "httpx", "pyarrow")
+    .add_local_file("ace_eval.py", "/root/ace_eval.py")
+    .add_local_file("ace_eval_prompts.py", "/root/ace_eval_prompts.py")
+    .add_local_dir("ace_scoring", "/root/ace_scoring")
+)
+
 results_vol = modal.Volume.from_name("ace-eval-results", create_if_missing=True)
 model_cache = modal.Volume.from_name("model-cache", create_if_missing=True)
 
@@ -96,6 +106,39 @@ VOLUMES = {
     "/results": results_vol,
     "/root/.cache/huggingface": model_cache,
 }
+
+
+# ---------------------------------------------------------------------------
+# Required env vars (set by Modal secrets)
+# ---------------------------------------------------------------------------
+REQUIRED_ENV_VARS = {
+    "SEARCHAPI_IO_KEY": "searchapi-secret",
+    "OPENAI_API_KEY": "openai-secret",
+    "JINA_API_KEY": "jina-secret",
+    "HF_TOKEN": "huggingface-secret",
+}
+
+
+def _check_env_vars():
+    """Validate all required API keys are set. Raises RuntimeError with details."""
+    missing = []
+    empty = []
+    for var, secret_name in REQUIRED_ENV_VARS.items():
+        val = os.environ.get(var)
+        if val is None:
+            missing.append(f"  {var} (Modal secret: {secret_name})")
+        elif not val.strip():
+            empty.append(f"  {var} (Modal secret: {secret_name}) — set but empty")
+    if missing or empty:
+        parts = []
+        if missing:
+            parts.append("Missing env vars:\n" + "\n".join(missing))
+        if empty:
+            parts.append("Empty env vars:\n" + "\n".join(empty))
+        parts.append(
+            "Fix: create/update Modal secrets with `modal secret create <name> VAR=value`"
+        )
+        raise RuntimeError("\n".join(parts))
 
 
 # ---------------------------------------------------------------------------
@@ -121,6 +164,9 @@ def _run_eval_inner(
 
     import httpx
     from openai import OpenAI
+
+    # Validate all API keys before starting expensive GPU work
+    _check_env_vars()
 
     if judge_model:
         os.environ["ACE_JUDGE_MODEL"] = judge_model
@@ -258,8 +304,11 @@ def _run_eval_inner(
         )
         return json.dumps(summary)
     finally:
-        proc.terminate()
-        proc.wait(timeout=10)
+        proc.kill()
+        try:
+            proc.wait(timeout=5)
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -268,7 +317,7 @@ def _run_eval_inner(
 @app.function(
     image=eval_image,
     gpu="H100",
-    timeout=7200,
+    timeout=14400,
     secrets=SECRETS,
     volumes=VOLUMES,
 )
@@ -300,7 +349,7 @@ def eval_1gpu(
 @app.function(
     image=eval_image,
     gpu="H100:2",
-    timeout=7200,
+    timeout=14400,
     secrets=SECRETS,
     volumes=VOLUMES,
 )
@@ -327,6 +376,127 @@ def eval_2gpu(
         prompt_preset=prompt_preset,
         runs=runs,
     )
+
+
+# ---------------------------------------------------------------------------
+# Coordinator: runs on Modal (no GPU), spawns GPU shards, collects results.
+# Survives --detach so shards keep running when local process disconnects.
+# ---------------------------------------------------------------------------
+@app.function(
+    image=coord_image,
+    timeout=21600,  # 6 hours
+    secrets=SECRETS,
+    volumes={"/results": results_vol},
+)
+def coordinate_model_eval(
+    model_name: str,
+    tasks_json: str,
+    large: bool,
+    shards: int,
+    workers: int = 4,
+    max_turns: int = 10,
+    max_searches: int = 5,
+    max_browses: int = 5,
+    judge_model: str = "",
+    prompt_preset: str = "",
+    runs: int = 1,
+) -> str:
+    """Spawn GPU shards for a single model and collect results."""
+    import sys
+
+    sys.path.insert(0, "/root")
+    from ace_eval import build_eval_summary
+
+    tasks = json.loads(tasks_json)
+    fn = eval_2gpu if large else eval_1gpu
+    gpu_desc = "2xH100" if large else "1xH100"
+
+    spawn_kwargs = dict(
+        workers=workers,
+        max_turns=max_turns,
+        max_searches=max_searches,
+        max_browses=max_browses,
+        judge_model=judge_model,
+        prompt_preset=prompt_preset,
+        runs=runs,
+    )
+
+    # shard_tasks tracks which tasks each shard got (for failure reporting)
+    handles = []
+    shard_tasks: dict[int, list[dict]] = {}
+    if shards > 1:
+        chunks = [(i, tasks[i::shards]) for i in range(shards) if tasks[i::shards]]
+        for shard_idx, chunk in chunks:
+            print(
+                f"  Dispatching shard {shard_idx + 1}/{shards} "
+                f"({len(chunk)} tasks, {gpu_desc})",
+                flush=True,
+            )
+            h = fn.spawn(
+                model_name=model_name, tasks_json=json.dumps(chunk), **spawn_kwargs
+            )
+            handles.append((shard_idx, h))
+            shard_tasks[shard_idx] = chunk
+    else:
+        print(f"  Dispatching {model_name} ({gpu_desc})", flush=True)
+        h = fn.spawn(
+            model_name=model_name, tasks_json=json.dumps(tasks), **spawn_kwargs
+        )
+        handles.append((0, h))
+        shard_tasks[0] = tasks
+
+    # Wait for all shards
+    all_results = []
+    max_time = 0.0
+    for shard_idx, handle in sorted(handles):
+        try:
+            summary_json = handle.get()
+            summary = json.loads(summary_json)
+            all_results.extend(summary.get("results", []))
+            max_time = max(max_time, summary.get("total_time_seconds", 0))
+            print(
+                f"  Shard {shard_idx + 1}: {summary['completed']}/{summary['total_tasks']} "
+                f"completed in {summary['total_time_seconds']}s",
+                flush=True,
+            )
+        except Exception as e:
+            print(f"  Shard {shard_idx + 1}: FAILED: {e}", flush=True)
+            # Add error entries for all tasks in this failed shard
+            for task in shard_tasks.get(shard_idx, []):
+                for run_id in range(1, runs + 1):
+                    entry = {
+                        "task_id": task["task_id"],
+                        "domain": task.get("domain", "unknown"),
+                        "status": f"error: shard {shard_idx + 1} failed: {e}",
+                        "elapsed": 0,
+                    }
+                    if runs > 1:
+                        entry["run_id"] = run_id
+                    all_results.append(entry)
+
+    # Build merged summary
+    from pathlib import Path
+
+    merged = build_eval_summary(model_name, all_results, max_time)
+    merged["shards"] = len(handles)
+
+    model_dir = model_name.replace("/", "_")
+    if prompt_preset:
+        model_dir = f"{model_dir}_{prompt_preset}"
+    summary_path = Path("/results") / model_dir / "summary.json"
+    summary_path.parent.mkdir(parents=True, exist_ok=True)
+    with open(summary_path, "w") as f:
+        json.dump(merged, f, indent=2)
+    results_vol.commit()
+
+    ok = merged["completed"]
+    failed = merged["failed"]
+    print(
+        f"\n{model_name}: {ok}/{len(all_results)} completed, {failed} failed, "
+        f"{max_time:.1f}s wall time",
+        flush=True,
+    )
+    return json.dumps(merged)
 
 
 # ---------------------------------------------------------------------------
@@ -393,84 +563,41 @@ def main(
     if shards > 1:
         print(f"Shards: {shards} (each model gets {shards} GPU containers)")
 
-    # Dispatch all models in parallel (each gets its own GPU container)
-    # With shards > 1, each model gets N containers with disjoint task subsets
-    spawn_kwargs = dict(
-        workers=workers,
-        max_turns=max_turns,
-        max_searches=max_searches,
-        max_browses=max_browses,
-        judge_model=judge_model,
-        prompt_preset=prompt,
-        runs=runs,
-    )
-
-    # handles: {model: [(shard_idx, handle), ...]}
-    handles: dict[str, list] = {}
+    # Dispatch via coordinator (runs on Modal, survives --detach)
+    handles: dict[str, object] = {}
     for m in model_list:
         large = _is_large_model(m)
-        fn = eval_2gpu if large else eval_1gpu
         gpu_desc = "2xH100" if large else "1xH100"
-        handles[m] = []
-
-        if shards > 1:
-            chunks = [(i, tasks[i::shards]) for i in range(shards) if tasks[i::shards]]
-            for shard_idx, chunk in chunks:
-                print(
-                    f"  Dispatching {m} shard {shard_idx + 1}/{shards} ({len(chunk)} tasks, {gpu_desc})..."
-                )
-                h = fn.spawn(model_name=m, tasks_json=json.dumps(chunk), **spawn_kwargs)
-                handles[m].append((shard_idx, h))
-        else:
-            print(f"  Dispatching {m} ({gpu_desc})...")
-            h = fn.spawn(model_name=m, tasks_json=json.dumps(tasks), **spawn_kwargs)
-            handles[m].append((0, h))
-
-    # Collect results as they finish, merging shards per model
-    from ace_eval import build_eval_summary
-
-    all_summaries = {}
-    for m, shard_handles in handles.items():
-        n_shards = len(shard_handles)
-        print(f"\nWaiting for {m} ({n_shards} shard(s))...")
-
-        all_results = []
-        max_time = 0.0
-        for shard_idx, handle in sorted(shard_handles):
-            try:
-                summary_json = handle.get()
-                summary = json.loads(summary_json)
-                all_results.extend(summary.get("results", []))
-                max_time = max(max_time, summary.get("total_time_seconds", 0))
-                print(
-                    f"  Shard {shard_idx + 1}: {summary['completed']}/{summary['total_tasks']} completed "
-                    f"in {summary['total_time_seconds']}s"
-                )
-            except Exception as e:
-                print(f"  Shard {shard_idx + 1}: FAILED: {e}")
-
-        # Build proper merged summary with domain stats, task aggregation, etc.
-        merged = build_eval_summary(m, all_results, max_time)
-        merged["shards"] = n_shards
-        all_summaries[m] = merged
-
-        ok = merged["completed"]
-        failed = merged["failed"]
-        print(
-            f"  Total: {ok}/{len(all_results)} completed, {failed} failed, {max_time:.1f}s wall time"
+        print(f"  Dispatching {m} via coordinator ({shards} shard(s), {gpu_desc})...")
+        h = coordinate_model_eval.spawn(
+            model_name=m,
+            tasks_json=json.dumps(tasks),
+            large=large,
+            shards=shards,
+            workers=workers,
+            max_turns=max_turns,
+            max_searches=max_searches,
+            max_browses=max_browses,
+            judge_model=judge_model,
+            prompt_preset=prompt,
+            runs=runs,
         )
+        handles[m] = h
 
-        # Write merged summary to volume (overwrites partial per-shard summaries)
-        if n_shards > 1:
-            model_dir = m.replace("/", "_")
-            if prompt:
-                model_dir = f"{model_dir}_{prompt}"
-            summary_path = f"eval_results/{model_dir}/summary.json"
-            try:
-                with open(summary_path, "w") as f:
-                    json.dump(merged, f, indent=2)
-                print(f"  Merged summary written to {summary_path}")
-            except Exception:
-                pass  # local dir may not exist; volume has per-shard copies
+    # Collect results (fails gracefully in detach mode — coordinator keeps running)
+    for m, h in handles.items():
+        print(f"\nWaiting for {m}...")
+        try:
+            summary_json = h.get()
+            summary = json.loads(summary_json)
+            ok = summary["completed"]
+            failed = summary["failed"]
+            print(
+                f"  {ok}/{summary['total_tasks']} completed, {failed} failed, "
+                f"{summary['total_time_seconds']}s"
+            )
+        except Exception as e:
+            print(f"  Local collection failed: {e}")
+            print("  (coordinator still running on Modal — results go to volume)")
 
     print("\nDone.")

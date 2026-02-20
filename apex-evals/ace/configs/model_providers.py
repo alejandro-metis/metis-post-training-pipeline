@@ -7,11 +7,9 @@ their responses into a unified format for downstream processing.
 """
 
 from abc import ABC, abstractmethod
-from typing import Dict, List, Any
+from typing import Dict, Any
 from google import genai
 from google.genai import types
-import json
-import os
 
 from configs.logging_config import setup_logging
 logger = setup_logging(__name__)
@@ -340,8 +338,8 @@ class OpenAIProvider(BaseProvider):
         )
 
         print(f"   Using OpenAI Responses API with model: {model_name}")
-        print(f"   Web search enabled: Yes")
-        print(f"   Timeout: 1500s (25 minutes)")
+        print("   Web search enabled: Yes")
+        print("   Timeout: 1500s (25 minutes)")
 
         # Use Responses API with web_search tool and reasoning effort
         response = client.responses.create(
@@ -472,7 +470,7 @@ class ClaudeProvider(BaseProvider):
 
         print(f"   Using Anthropic model: {api_model_name}")
         print(f"   Max tokens: {model_config['max_tokens']} (thinking budget: {model_config['budget_tokens']})")
-        print(f"   Web search enabled: Yes (server-side tool)")
+        print("   Web search enabled: Yes (server-side tool)")
 
         response = client.messages.create(
             model=api_model_name,

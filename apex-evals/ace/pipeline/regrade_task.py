@@ -134,7 +134,7 @@ def fetch_task_response(task_id, domain, model_name, run_number=None):
         ]
     }
 
-    print(f"✅ Loaded:")
+    print("✅ Loaded:")
     print(f"   - Response text: {len(response_text)} chars")
     print(f"   - Criteria: {len(test_case_data['criteria'])}")
     print(f"   - Direct grounding (API chunks): {'Yes' if direct_grounding else 'No'}")
@@ -147,7 +147,7 @@ def run_grounding_pipeline(response_text, test_case_data, direct_grounding=None)
     Run grounding pipeline (Stage 2)
     This handles product mapping, link extraction, and scraping.
     """
-    print(f"\nRunning Grounding Pipeline (Stage 2)...")
+    print("\nRunning Grounding Pipeline (Stage 2)...")
 
     # Create input for grounding pipeline (simulating 1_grounded_response.json)
     # We pass the Raw Response Text and API Chunks.
@@ -192,7 +192,7 @@ def run_grounding_pipeline(response_text, test_case_data, direct_grounding=None)
         with open(scraped_file, 'r') as f:
             scraped_data = json.load(f)
 
-        print(f"✅ Grounding complete:")
+        print("✅ Grounding complete:")
         print(f"   - Products Found: {len(scraped_data.get('productSourceMap', []))}")
         print(f"   - Sources Scraped: {len(scraped_data.get('sources', []))}")
 
@@ -210,7 +210,7 @@ def run_autograder(scraped_data, domain, model_name=None):
     """
     Run autograder (Stage 3) on scraped data
     """
-    print(f"\nRunning Autograder (Stage 3)...")
+    print("\nRunning Autograder (Stage 3)...")
 
     # Create temp files
     with tempfile.NamedTemporaryFile(mode='w', suffix='_scraped_for_grading.json', delete=False) as tmp_in:
@@ -230,7 +230,7 @@ def run_autograder(scraped_data, domain, model_name=None):
         scores = results.get('criteria_scores_only', [])
         total_score = results.get('total_score')
 
-        print(f"✅ Autograder complete:")
+        print("✅ Autograder complete:")
         print(f"   - Total Score: {total_score}")
         print(f"   - Scores: {scores}")
 
@@ -248,10 +248,10 @@ def update_supabase(task_id, domain, model_name, run_number, scraped_data, autog
     Update Supabase with new results (preserving Response Text)
     """
     if not USE_SUPABASE:
-        print(f"\n⚠️  Skipping Supabase update (not available)")
+        print("\n⚠️  Skipping Supabase update (not available)")
         return
 
-    print(f"\nUpdating Supabase...")
+    print("\nUpdating Supabase...")
 
     config = get_domain_config_for_model(domain, model_name)
     task_table = config['task_table']
@@ -352,7 +352,7 @@ def update_supabase(task_id, domain, model_name, run_number, scraped_data, autog
                 else:
                     print(f"❌ Failed to update criterion {criterion_id}: {e}")
 
-    print(f"✅ Database Updated successfully!")
+    print("✅ Database Updated successfully!")
 
 
 def regrade_task(task_id, domain, model_name, run_number, dry_run=False):
@@ -363,7 +363,7 @@ def regrade_task(task_id, domain, model_name, run_number, dry_run=False):
         start_time = time.time()
 
         print("="*60)
-        print(f"REGRADE TASK (Re-run Grounding + Autograder)")
+        print("REGRADE TASK (Re-run Grounding + Autograder)")
         print("="*60)
         print(f"Task ID: {task_id}")
         print(f"Domain: {domain}")

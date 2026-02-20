@@ -282,7 +282,7 @@ if __name__ == '__main__':
     # Test with Reddit URL (or provide as argument)
     test_url = sys.argv[1] if len(sys.argv) > 1 else "https://www.reddit.com/r/singing/comments/173qi20/how_do_you_easily_develop_vibrato/"
 
-    print(f"Testing Reddit utilities...\n")
+    print("Testing Reddit utilities...\n")
     print(f"URL: {test_url}")
     print(f"Is Reddit URL: {is_reddit_url(test_url)}\n")
 
@@ -291,7 +291,7 @@ if __name__ == '__main__':
         result = get_reddit_content(test_url)
 
         if result['success']:
-            print(f"✅ Success!")
+            print("✅ Success!")
             print(f"Title: {result['title']}")
             print(f"Markdown length: {len(result['markdown'])} chars")
             print(f"\nFirst 500 chars:\n{result['markdown'][:500]}...")
@@ -303,7 +303,7 @@ if __name__ == '__main__':
             # Optionally save to file
             with open("reddit_output.md", "w", encoding="utf-8") as f:
                 f.write(formatted)
-            print(f"\n✅ Output saved to reddit_output.md")
+            print("\n✅ Output saved to reddit_output.md")
         else:
             print(f"❌ Error: {result['error']}")
 

@@ -3,11 +3,10 @@ LiteLLM Client for OpenAI, Anthropic, Google, xAI, and custom providers.
 """
 
 import logging
-import os
 import re
 import time
 import traceback
-from typing import Dict, List, Any, Optional
+from typing import Dict, List, Any
 
 import litellm
 from litellm import acompletion, token_counter, cost_per_token, completion_cost
@@ -20,9 +19,7 @@ from .base import (
     LLMResponse,
     LLMUsage,
     LLMMessage,
-    LLMRole,
 )
-from .model_limits import get_context_limit_async
 
 logging.basicConfig(
     level=logging.INFO,

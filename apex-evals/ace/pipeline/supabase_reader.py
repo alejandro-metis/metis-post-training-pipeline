@@ -89,8 +89,8 @@ def parse_supabase_table(table_name='ACE TEST', exclude_types=None, criterion_ty
 
         if not rows:
             print(f"⚠️  No data found in {table_name} table")
-            print(f"   This might be due to Row Level Security (RLS) policies.")
-            print(f"   Check that the anon key has SELECT permissions on this table.")
+            print("   This might be due to Row Level Security (RLS) policies.")
+            print("   Check that the anon key has SELECT permissions on this table.")
             return {}
 
         test_cases = defaultdict(lambda: {'prompt': '', 'criteria': []})

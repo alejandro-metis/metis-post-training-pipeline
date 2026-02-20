@@ -8,8 +8,7 @@ import re
 import os
 import sys
 import requests
-from typing import Optional, Dict, List
-from urllib.parse import urlparse, parse_qs
+from typing import Optional, Dict
 
 # Load environment variables from .env file
 try:
@@ -221,7 +220,7 @@ if __name__ == '__main__':
         result = get_youtube_transcript(video_id)
 
         if result['success']:
-            print(f"✅ Success!")
+            print("✅ Success!")
             print(f"Transcript length: {len(result['transcript'])} chars")
             print(f"Language: {result['language']}")
             print(f"\nFirst 200 chars: {result['transcript'][:200]}...")

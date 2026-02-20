@@ -1,6 +1,5 @@
 import asyncio
 import logging
-from importlib import import_module
 from typing import Any, Dict, List, Optional
 
 import aiohttp

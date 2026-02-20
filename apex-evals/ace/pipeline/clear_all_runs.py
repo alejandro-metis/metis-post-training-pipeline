@@ -210,7 +210,7 @@ def main():
 
     if successful_clears == len(results):
         print("\n✅ All runs cleared successfully!")
-        print(f"\nYou can now run a fresh pipeline:")
+        print("\nYou can now run a fresh pipeline:")
         print(f"  python3 pipeline/runner.py {args.domain} --model {args.model}")
         sys.exit(0)
     else:

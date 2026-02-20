@@ -26,7 +26,6 @@ MODELS = list(MODEL_REGISTRY.keys())
 
 def run_single_model(domain, model, run_number, workers, runner_flags):
     """Run runner.py for one model with live output"""
-    import re
     from configs.model_providers import get_provider_for_model
     
     script_dir = os.path.dirname(os.path.abspath(__file__))

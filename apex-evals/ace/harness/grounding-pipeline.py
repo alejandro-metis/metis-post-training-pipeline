@@ -20,7 +20,7 @@ import re
 import sys
 import time
 from datetime import datetime
-from typing import List, Dict, Set, Optional, Any
+from typing import List, Optional
 
 # Add project root to path FIRST
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -509,11 +509,11 @@ def create_recommendation_source_map(response_text, grounding_json, query):
     chunks = grounding_json.get('groundingChunks', [])
 
     # Step 1: Extract recommendations (always do this, even without API grounding)
-    print(f"   Step 1: Extracting recommendations...")
+    print("   Step 1: Extracting recommendations...")
     recommendation_names = extract_recommendations(response_text, query)
 
     if not recommendation_names:
-        print(f"   ⚠️  No recommendations extracted from response")
+        print("   ⚠️  No recommendations extracted from response")
         return []
 
     print(f"   ✅ Found {len(recommendation_names)} recommendations")
@@ -526,7 +526,7 @@ def create_recommendation_source_map(response_text, grounding_json, query):
 
     # Step 2: Map citations to recommendations (skip if no API grounding)
     if not chunks:
-        print(f"   ⚠️  No API grounding chunks - will rely on response text links only")
+        print("   ⚠️  No API grounding chunks - will rely on response text links only")
     else:
         print(f"   Step 2: Mapping {len(supports)} citations to recommendations in parallel...")
 
@@ -606,12 +606,12 @@ def create_recommendation_source_map(response_text, grounding_json, query):
         if unmapped_indices:
             print(f"   ⚠️  Warning: {len(unmapped_indices)} source(s) not mapped to any recommendation")
             print(f"      Unmapped source indices: {sorted(unmapped_indices)}")
-            print(f"      This happens when Gemini provides sources but doesn't cite them in the response")
+            print("      This happens when Gemini provides sources but doesn't cite them in the response")
 
-        print(f"   ✅ Mapped recommendations to grounding sources")
+        print("   ✅ Mapped recommendations to grounding sources")
         print(f"      Total sources: {len(chunks)} | Mapped: {len(all_mapped_indices)} | Unmapped: {len(unmapped_indices)}")
     else:
-        print(f"   No API grounding - products will use response text links as sources")
+        print("   No API grounding - products will use response text links as sources")
 
     return final_map
 
@@ -660,7 +660,6 @@ class GroundingProcessor:
 
     def scrape_sources(self, chunks):
         """Scrape all source URLs using Firecrawl"""
-        import time
         scraping_start = time.time()
 
         print(f'Scraping {len(chunks)} sources...\n')
@@ -675,20 +674,20 @@ class GroundingProcessor:
                 # Resolve redirects if needed (for vertexaisearch URLs)
                 final_url = chunk['uri']
                 if 'vertexaisearch.cloud.google.com' in chunk['uri']:
-                    print(f'   Resolving redirect...')
+                    print('   Resolving redirect...')
                     resolved = resolve_redirect_url(chunk['uri'])
                     if resolved:
                         final_url = resolved
                         print(f'   ✅ Resolved to: {final_url[:80]}...')
                     else:
-                        print(f'   ⚠️  Could not resolve redirect, using original URL')
+                        print('   ⚠️  Could not resolve redirect, using original URL')
 
                 # Check if this is a YouTube URL
                 is_youtube = is_youtube_url(final_url)
                 youtube_transcript = None
 
                 if is_youtube:
-                    print(f'   YouTube video detected')
+                    print('   YouTube video detected')
                     video_id = extract_video_id(final_url)
 
                     if video_id:
@@ -701,15 +700,15 @@ class GroundingProcessor:
                         else:
                             print(f'   ⚠️  Transcript unavailable: {transcript_result["error"]}')
                     else:
-                        print(f'   ⚠️  Could not extract video ID')
+                        print('   ⚠️  Could not extract video ID')
 
                 # Check if this is a Reddit URL
                 is_reddit = is_reddit_url(final_url)
                 reddit_content = None
 
                 if is_reddit:
-                    print(f'   Reddit post detected')
-                    print(f'   Fetching Reddit discussion...')
+                    print('   Reddit post detected')
+                    print('   Fetching Reddit discussion...')
                     reddit_result = get_reddit_content(final_url)
 
                     if reddit_result['success']:
@@ -799,7 +798,7 @@ class GroundingProcessor:
                                 title or chunk['title']
                             )
                             markdown = transcript_section + markdown
-                            print(f'   ✅ Combined transcript + page content')
+                            print('   ✅ Combined transcript + page content')
 
                         scraped_data.append({
                             'index': chunk['index'],
@@ -829,7 +828,7 @@ class GroundingProcessor:
 
                             # If YouTube with transcript, save transcript even if Firecrawl failed
                             if youtube_transcript:
-                                print(f'   ⚠️  Firecrawl failed but have transcript - saving transcript only')
+                                print('   ⚠️  Firecrawl failed but have transcript - saving transcript only')
                                 markdown = format_transcript_markdown(
                                     youtube_transcript,
                                     final_url,  # Use resolved URL
@@ -966,7 +965,6 @@ class GroundingProcessor:
 
     def process(self, input_file, output_file):
         """Main processing pipeline using Firecrawl for scraping"""
-        import time
         pipeline_start = time.time()
 
         print('[*] Starting Grounding Pipeline\n')
@@ -999,11 +997,11 @@ class GroundingProcessor:
 
         # --- LOGIC MOVED FROM STAGE 1 ---
         # Create recommendation-to-source mapping
-        print(f"\nCreating recommendation-to-source mapping...")
+        print("\nCreating recommendation-to-source mapping...")
         product_map = create_recommendation_source_map(response_text, input_data, query)
 
         # Extract and map response links
-        print(f"\nExtracting response text links...")
+        print("\nExtracting response text links...")
         product_names = [p['product_name'] for p in product_map] if product_map else []
 
         if product_names:
@@ -1076,11 +1074,11 @@ class GroundingProcessor:
 
                 # Summary
                 if not new_links and not existing_links_to_map:
-                    print(f"   No response text links to add")
+                    print("   No response text links to add")
             else:
-                print(f"   No links extracted from response text")
+                print("   No links extracted from response text")
         else:
-            print(f"   ⚠️  No products to map links to")
+            print("   ⚠️  No products to map links to")
 
         # Convert sets to lists in productSourceMap before saving
         for product in product_map:
@@ -1120,7 +1118,7 @@ class GroundingProcessor:
         print(f'   Sources: {len(output["sources"])}')
         print(f'   Scraped: {sum(1 for s in output["sources"] if not s["webpage_content"]["error"])}')
         print(f'   Failed: {sum(1 for s in output["sources"] if s["webpage_content"]["error"])}')
-        print(f'\nTiming:')
+        print('\nTiming:')
         print(f'   Scraping: {output["pipeline_timing"]["scraping_seconds"]}s')
         print(f'   Processing: {output["pipeline_timing"]["processing_seconds"]}s')
         print(f'   Total: {output["pipeline_timing"]["total_seconds"]}s')

@@ -431,6 +431,7 @@ def eval_single_task(
             "total_score": score_result.total_score,
             "total_hurdle_score": score_result.total_hurdle_score,
             "num_criteria": score_result.num_criteria,
+            "criteria_scores": score_result.criteria_scores,
         }
         if run_id is not None:
             result["run_id"] = run_id
@@ -455,12 +456,19 @@ def build_eval_summary(model: str, results: list[dict], total_time: float) -> di
 
     When results include run_id (multiple runs per task), adds per-task
     aggregation with mean/std scores.
+
+    Computes ACE-style metrics (matching paper Tables 2 & 3):
+    - ace_scores: overall and per-domain percentage scores
+    - criteria_type_scores: per criteria-type pass rates per domain
     """
+    from collections import defaultdict
+    import statistics
+
     ok_results = [r for r in results if r["status"] == "ok"]
     ok = len(ok_results)
     failed = len(results) - ok
 
-    domain_stats = {}
+    domain_stats: dict[str, dict] = {}
     for r in results:
         d = r.get("domain", "unknown")
         if d not in domain_stats:
@@ -498,32 +506,96 @@ def build_eval_summary(model: str, results: list[dict], total_time: float) -> di
         "results": results,
     }
 
-    # Per-task aggregation across runs (mean/std)
-    has_runs = any("run_id" in r for r in results)
-    if has_runs:
-        from collections import defaultdict
-        import statistics
+    # -- Per-task aggregation across runs (mean/std) --
+    by_task: dict[str, list[dict]] = defaultdict(list)
+    for r in ok_results:
+        by_task[str(r["task_id"])].append(r)
 
-        by_task: dict[str, list[dict]] = defaultdict(list)
+    task_agg = {}
+    for tid, runs in sorted(by_task.items()):
+        scores = [r["total_score"] for r in runs]
+        hurdle_scores = [r["total_hurdle_score"] for r in runs]
+        nc = runs[0]["num_criteria"]
+        score_pcts = [s / nc * 100 if nc > 0 else 0.0 for s in scores]
+        hurdle_pcts = [s / nc * 100 if nc > 0 else 0.0 for s in hurdle_scores]
+        task_agg[tid] = {
+            "domain": runs[0]["domain"],
+            "num_criteria": nc,
+            "num_runs": len(runs),
+            "scores": scores,
+            "mean_score": round(statistics.mean(scores), 2),
+            "std_score": round(statistics.stdev(scores), 2) if len(scores) > 1 else 0.0,
+            "mean_hurdle_score": round(statistics.mean(hurdle_scores), 2),
+            "score_pct": round(statistics.mean(score_pcts), 1),
+            "hurdle_score_pct": round(statistics.mean(hurdle_pcts), 1),
+        }
+    summary["task_aggregation"] = task_agg
+
+    # -- ACE-style percentage scores (paper Table 2) --
+    # Per-task pct = mean(hurdle_score / num_criteria * 100) across runs
+    # Per-domain pct = mean of per-task pcts
+    # Overall pct = mean of all per-task pcts
+    domain_task_pcts: dict[str, list[float]] = defaultdict(list)
+    domain_task_raw_pcts: dict[str, list[float]] = defaultdict(list)
+    for tid, tagg in task_agg.items():
+        d = tagg["domain"]
+        domain_task_pcts[d].append(tagg["hurdle_score_pct"])
+        domain_task_raw_pcts[d].append(tagg["score_pct"])
+
+    ace_domain_scores = {}
+    all_task_pcts: list[float] = []
+    all_task_raw_pcts: list[float] = []
+    for d in sorted(domain_task_pcts.keys()):
+        pcts = domain_task_pcts[d]
+        raw_pcts = domain_task_raw_pcts[d]
+        ace_domain_scores[d] = {
+            "score_pct": round(statistics.mean(pcts), 1),
+            "raw_score_pct": round(statistics.mean(raw_pcts), 1),
+            "num_tasks": len(pcts),
+        }
+        if len(pcts) > 1:
+            ace_domain_scores[d]["std_pct"] = round(statistics.stdev(pcts), 1)
+        all_task_pcts.extend(pcts)
+        all_task_raw_pcts.extend(raw_pcts)
+
+    ace_scores: dict = {
+        "overall": round(statistics.mean(all_task_pcts), 1) if all_task_pcts else 0.0,
+        "overall_raw": round(statistics.mean(all_task_raw_pcts), 1)
+        if all_task_raw_pcts
+        else 0.0,
+        "num_tasks": len(all_task_pcts),
+        "domains": ace_domain_scores,
+    }
+    if len(all_task_pcts) > 1:
+        ace_scores["overall_std"] = round(statistics.stdev(all_task_pcts), 1)
+    summary["ace_scores"] = ace_scores
+
+    # -- Per criteria-type scores (paper Table 3) --
+    # Group criterion scores by (domain, type), compute mean score * 100
+    # Note: score_pct can be negative for grounded criteria (Shopping/Gaming)
+    # since hallucination scores -1. For non-grounded (DIY/Food) it equals pass rate.
+    has_criteria_scores = any(r.get("criteria_scores") for r in ok_results)
+    if has_criteria_scores:
+        # criteria_scores: [[score, type, hurdle_tag], ...]
+        type_scores: dict[str, dict[str, list[int]]] = defaultdict(
+            lambda: defaultdict(list)
+        )
         for r in ok_results:
-            by_task[str(r["task_id"])].append(r)
+            d = r.get("domain", "unknown")
+            for cs in r.get("criteria_scores", []):
+                score, ctype, _hurdle = cs
+                type_scores[d][ctype].append(score)
 
-        task_agg = {}
-        for tid, runs in sorted(by_task.items()):
-            scores = [r["total_score"] for r in runs]
-            hurdle_scores = [r["total_hurdle_score"] for r in runs]
-            task_agg[tid] = {
-                "domain": runs[0]["domain"],
-                "num_criteria": runs[0]["num_criteria"],
-                "num_runs": len(runs),
-                "scores": scores,
-                "mean_score": round(statistics.mean(scores), 2),
-                "std_score": round(statistics.stdev(scores), 2)
-                if len(scores) > 1
-                else 0.0,
-                "mean_hurdle_score": round(statistics.mean(hurdle_scores), 2),
-            }
-        summary["task_aggregation"] = task_agg
+        criteria_type_scores = {}
+        for d in sorted(type_scores.keys()):
+            criteria_type_scores[d] = {}
+            for ctype in sorted(type_scores[d].keys()):
+                scores = type_scores[d][ctype]
+                criteria_type_scores[d][ctype] = {
+                    "score_pct": round(statistics.mean(scores) * 100, 1),
+                    "count": len(scores),
+                }
+        summary["criteria_type_scores"] = criteria_type_scores
 
     return summary
 
@@ -639,14 +711,124 @@ def run_eval_for_model(
     return results
 
 
+def rebuild_summary(results_dir: str) -> None:
+    """Rebuild summary.json from on-disk autograder results.
+
+    Reads 3_autograder_results.json + trace.json from each task/run directory,
+    reconstructs the results list with criteria_scores, and regenerates
+    summary.json with ACE-style metrics.
+    """
+    from pathlib import Path
+
+    results_path = Path(results_dir)
+    if not results_path.is_dir():
+        print(f"Error: {results_dir} is not a directory")
+        return
+
+    # Read existing summary for model name and timing info
+    summary_file = results_path / "summary.json"
+    old_summary = {}
+    if summary_file.exists():
+        with open(summary_file) as f:
+            old_summary = json.load(f)
+
+    model_name = old_summary.get("model", results_path.name)
+    total_time = old_summary.get("total_time_seconds", 0.0)
+
+    # Scan for autograder result files
+    results = []
+    for ag_file in sorted(results_path.rglob("3_autograder_results.json")):
+        # Extract domain, task_id, run_id from path
+        # Pattern: {domain}/task_{id}/run_{n}/3_autograder_results.json
+        # or:      {domain}/task_{id}/3_autograder_results.json
+        parts = ag_file.relative_to(results_path).parts
+        if len(parts) < 2:
+            continue
+
+        domain = parts[0]
+        task_dir = parts[1]
+        if not task_dir.startswith("task_"):
+            continue
+        task_id = task_dir.replace("task_", "")
+
+        run_id = None
+        if len(parts) >= 3 and parts[2].startswith("run_"):
+            run_id = int(parts[2].replace("run_", ""))
+
+        with open(ag_file) as f:
+            ag_data = json.load(f)
+
+        # Read trace for timing/search/browse counts
+        trace_file = ag_file.parent / "trace.json"
+        elapsed = 0.0
+        response_len = 0
+        n_searches = 0
+        n_browses = 0
+        if trace_file.exists():
+            with open(trace_file) as f:
+                trace = json.load(f)
+            elapsed = trace.get("elapsed_seconds", 0.0)
+            response_len = len(trace.get("response_text", ""))
+            n_searches = trace.get("num_searches", 0)
+            n_browses = trace.get("num_browses", 0)
+
+        result: dict = {
+            "task_id": task_id,
+            "domain": domain,
+            "status": "ok",
+            "elapsed": elapsed,
+            "response_len": response_len,
+            "searches": n_searches,
+            "browses": n_browses,
+            "total_score": ag_data.get("total_score", 0),
+            "total_hurdle_score": ag_data.get("total_hurdle_score", 0),
+            "num_criteria": ag_data.get("num_criteria", 0),
+            "criteria_scores": ag_data.get("criteria_scores", []),
+        }
+        if run_id is not None:
+            result["run_id"] = run_id
+        results.append(result)
+
+    if not results:
+        print(f"No autograder results found in {results_dir}")
+        return
+
+    print(f"Found {len(results)} result files across {results_dir}")
+
+    summary = build_eval_summary(model_name, results, total_time)
+    with open(summary_file, "w") as f:
+        json.dump(summary, f, indent=2, ensure_ascii=False)
+
+    ace = summary.get("ace_scores", {})
+    print(f"\nACE Scores for {model_name}:")
+    print(f"  Overall: {ace.get('overall', 0)}%")
+    for d, ds in ace.get("domains", {}).items():
+        print(f"  {d:>10}: {ds['score_pct']}%")
+
+    if "criteria_type_scores" in summary:
+        print("\nCriteria Type Breakdown:")
+        for d, types in summary["criteria_type_scores"].items():
+            print(f"  {d}:")
+            for ctype, info in types.items():
+                print(f"    {ctype:45} {info['score_pct']:>6.1f}%  (n={info['count']})")
+
+    print(f"\nSaved to {summary_file}")
+
+
 def main():
     parser = argparse.ArgumentParser(description="Run ACE baseline eval with tools")
 
     # Model(s) — support both --model and --models
-    model_group = parser.add_mutually_exclusive_group(required=True)
+    model_group = parser.add_mutually_exclusive_group(required=False)
     model_group.add_argument("--model", help="Single model name")
     model_group.add_argument(
         "--models", nargs="+", help="Multiple model names for baseline comparison"
+    )
+
+    parser.add_argument(
+        "--rebuild-summary",
+        metavar="DIR",
+        help="Rebuild summary.json from existing results directory (no eval run needed)",
     )
 
     parser.add_argument(
@@ -707,6 +889,15 @@ def main():
         help="Number of runs per task (default: 1). Use >1 for variance estimation.",
     )
     args = parser.parse_args()
+
+    # Rebuild summary mode — no model needed
+    if args.rebuild_summary:
+        rebuild_summary(args.rebuild_summary)
+        return
+
+    # Require model for eval mode
+    if not args.model and not args.models:
+        parser.error("--model or --models is required (unless using --rebuild-summary)")
 
     # Set judge model via env var so ace_scoring.llm picks it up
     if args.judge_model:

@@ -12,15 +12,12 @@ import csv
 import json
 import os
 import sys
-from pathlib import Path
-from collections import defaultdict
 
 # Add project root to path FIRST
 script_dir = os.path.dirname(os.path.abspath(__file__))
 project_root = os.path.dirname(script_dir)
 sys.path.insert(0, project_root)
 
-from configs.config import config
 from configs.model_providers import MODEL_REGISTRY, get_provider_for_model
 
 # Constants
@@ -176,7 +173,7 @@ def get_local_task_data(task_id, domain, model_name, run_number):
         try:
             with open(test_case_file, 'r', encoding='utf-8') as f:
                 result['test_case'] = json.load(f)
-        except Exception as e:
+        except Exception:
             pass
     
     # Read grounded response
@@ -187,7 +184,7 @@ def get_local_task_data(task_id, domain, model_name, run_number):
                 # Handle null responseText
                 response_text = data.get('responseText')
                 result['response_text'] = response_text if response_text is not None else ''
-        except Exception as e:
+        except Exception:
             pass
     
     # Read scraped sources
@@ -217,7 +214,7 @@ def get_local_task_data(task_id, domain, model_name, run_number):
                 
                 result['product_source_map'] = enhanced_product_map
                 result['grounded_links'] = extract_grounded_links(enhanced_product_map)
-        except Exception as e:
+        except Exception:
             pass
     
     # Read autograder results
@@ -236,7 +233,7 @@ def get_local_task_data(task_id, domain, model_name, run_number):
                 result['scores'] = data.get('criteria_scores_only', [])
                 result['total_score'] = data.get('total_score', '')
                 result['total_hurdle_score'] = data.get('total_hurdle_score', '')
-        except Exception as e:
+        except Exception:
             pass
     
     return result
@@ -273,7 +270,7 @@ def export_domain(domain):
     print(f"{'='*80}")
     
     # Load workflows from dataset
-    print(f"Loading workflows from dataset...")
+    print("Loading workflows from dataset...")
     workflows = load_workflows_from_dataset(domain)
     print(f"  [+] Loaded {len(workflows)} unique task workflows")
     
@@ -399,7 +396,7 @@ def main():
     print(f"Output directory: {OUTPUT_DIR}")
     print(f"Domains to export: {', '.join(domains_to_export)}")
     print(f"Models per task: {len(ALL_MODELS)}")
-    print(f"Runs per model: 8")
+    print("Runs per model: 8")
     print("="*80)
     
     # Create output directory

@@ -304,7 +304,7 @@ async def main():
             saved += 1
         else:
             skipped += 1
-            logger.warning(f"Task skipped (not saved)")
+            logger.warning("Task skipped (not saved)")
 
     logger.info(f"\nSaved: {saved} | Skipped: {skipped}")
 

@@ -63,7 +63,7 @@ Examples:
                     if not test_result.data:
                         print(f"⚠️  Task {args.task_id} not found in Supabase table '{criteria_table}'")
                         print(f"   Run 'python3 pipeline/init_from_dataset.py {args.domain} {args.model} --supabase' first")
-                        print(f"   Or remove --supabase flag to use local files")
+                        print("   Or remove --supabase flag to use local files")
                         sys.exit(1)
                     
                     print(f"   Supabase verified (task {args.task_id} exists in {criteria_table})")
@@ -83,7 +83,7 @@ Examples:
     print(f"Run: {args.run}")
     print(f"Domain: {args.domain}")
     if not args.supabase:
-        print(f"Mode: Local files only (default)")
+        print("Mode: Local files only (default)")
 
     result = process_single_task_with_original_scripts(
         args.task_id,

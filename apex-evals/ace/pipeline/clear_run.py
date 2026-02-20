@@ -5,9 +5,7 @@ Supports all domains: Gaming, Shopping, Food
 Supports all models: gemini-2.5-pro, gpt-5, gpt-4o, etc.
 """
 import os
-import shutil
 import sys
-import time
 
 # Add project root to path FIRST
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
@@ -274,15 +272,15 @@ def main():
     if use_supabase:
         logger.info(f"Tables: {domain_config['task_table']}, {domain_config['criteria_table']}")
     else:
-        logger.info(f"Mode: Local files only (default)")
+        logger.info("Mode: Local files only (default)")
 
     logger.warning("This will:")
     if use_supabase:
         logger.warning(f"  1. Clear Run {run_number} data from Supabase tables (batch size: 50)")
-        logger.warning(f"  2. Delete run files (preserves 0_test_case.json):")
+        logger.warning("  2. Delete run files (preserves 0_test_case.json):")
     else:
-        logger.warning(f"  1. Delete run files (preserves 0_test_case.json):")
-    logger.warning(f"     Files: 1_grounded_response.json, 1_model_response.json, 2_scraped_sources.json, 3_autograder_results.json")
+        logger.warning("  1. Delete run files (preserves 0_test_case.json):")
+    logger.warning("     Files: 1_grounded_response.json, 1_model_response.json, 2_scraped_sources.json, 3_autograder_results.json")
     logger.warning(f"     From: results/{provider_name}/{model_name}/{domain}/run_{run_number}/task_*/")
     logger.warning("This action cannot be undone!")
 
@@ -317,7 +315,7 @@ def main():
         sys.exit(1)
 
     logger.info(f"RUN {run_number} CLEARED SUCCESSFULLY!")
-    logger.info(f"You can now run a fresh pipeline:")
+    logger.info("You can now run a fresh pipeline:")
     logger.info(f"  python3 pipeline/runner.py {domain} --model {model_name} --run {run_number} --workers 5")
 
 

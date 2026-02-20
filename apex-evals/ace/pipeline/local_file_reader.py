@@ -201,7 +201,7 @@ def read_grounded_response(task_id, domain, model_name, run_number):
     response_text = response_data.get('responseText', '')
     direct_grounding = response_data.get('direct_grounding', {})
 
-    print(f"✅ Loaded from local files:")
+    print("✅ Loaded from local files:")
     print(f"   - Response text: {len(response_text)} chars")
     print(f"   - Criteria: {len(test_case_data.get('criteria', []))}")
     print(f"   - Direct grounding: {'Yes' if direct_grounding else 'No'}")
@@ -231,7 +231,7 @@ if __name__ == '__main__':
         first_task = task_ids[0]
         print(f"\nReading task {first_task}...")
         test_case = get_test_case(first_task, args.domain, args.model, args.run)
-        print(f"✅ Loaded test case:")
+        print("✅ Loaded test case:")
         print(f"   - Prompt: {test_case.get('prompt', '')[:100]}...")
         print(f"   - Criteria: {len(test_case.get('criteria', []))}")
 
