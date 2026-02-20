@@ -78,9 +78,23 @@ def enrich_snippet_sources(
         if not url:
             continue
 
+        # Skip URLs that permanently failed in a previous rescore run
+        if wc.get("enrichment_error"):
+            continue
+
         page_markdown, err = fetch_page(url, max_chars=max_chars_per_source)
         if err:
             print(f"[ace_scoring] Failed to enrich {url}: {err}")
+            # Mark non-transient failures so future rescores skip them.
+            # Timeouts, connection errors, and rate limits are transient.
+            transient = err.startswith("Connection failed:") or err in (
+                "HTTP 429",
+                "HTTP 502",
+                "HTTP 503",
+                "HTTP 504",
+            )
+            if not transient:
+                wc["enrichment_error"] = err
             continue
 
         title = extract_title(page_markdown, fallback=url)

@@ -355,32 +355,7 @@ def eval_single_task(
         with open(out_dir / "2_scraped_sources.json", "w") as f:
             json.dump(autograder_input, f, indent=2, ensure_ascii=False)
 
-        # 2. Raw trace: response + full tool history for debugging
-        # (scoring fields added after grade_task below)
-
-        # 2.5. Enrich snippet-only sources with full page content via Jina
-        enrich_snippet_sources(autograder_input["sources"])
-
-        # 3. Score: run the scorer to produce 3_autograder_results.json
-        # Pass products from autograder_input to avoid double LLM extraction
-        existing_products = [
-            p["product_name"] for p in autograder_input.get("productSourceMap", [])
-        ]
-        score_result = grade_task(
-            task_id=task_id,
-            response_text=response_text,
-            criteria=task["criteria"],
-            sources=autograder_input["sources"],
-            product_source_map=autograder_input.get("productSourceMap"),
-            products=existing_products if existing_products is not None else None,
-            query=task["prompt"],
-            domain=domain,
-            shop_vs_product=task.get("shop_vs_product", "Product"),
-        )
-        with open(out_dir / "3_autograder_results.json", "w") as f:
-            json.dump(score_result.to_dict(), f, indent=2, ensure_ascii=False)
-
-        # Write enriched trace with tool usage stats + scoring results
+        # 2. Save trace immediately (before scoring) so model response is never lost
         trace = {
             "task_id": task_id,
             "domain": domain,
@@ -392,25 +367,74 @@ def eval_single_task(
             "num_browses": n_browses,
             "num_criteria": len(task["criteria"]),
             "elapsed_seconds": round(elapsed, 2),
-            "scoring": {
-                "total_score": score_result.total_score,
-                "total_hurdle_score": score_result.total_hurdle_score,
-                "num_criteria": score_result.num_criteria,
-                "products": score_result.products,
-                "summary": score_result.summary,
-                "per_criterion": [
-                    {
-                        "criterion_id": r.criterion_id,
-                        "description": r.description,
-                        "type": r.type,
-                        "score": r.score,
-                        "hurdle_tag": r.hurdle_tag,
-                        "stage_reached": r.stage_reached,
-                        "reasoning": r.reasoning,
-                    }
-                    for r in score_result.detailed_results
-                ],
-            },
+            "scoring": None,
+        }
+        with open(out_dir / "trace.json", "w") as f:
+            json.dump(trace, f, indent=2, ensure_ascii=False)
+
+        # 3. Enrich sources + score (both can fail on external APIs)
+        existing_products = [
+            p["product_name"] for p in autograder_input.get("productSourceMap", [])
+        ]
+        try:
+            # Enrich snippet-only sources with full page content via Jina
+            enrich_snippet_sources(autograder_input["sources"])
+
+            # Rewrite 2_scraped_sources.json with enriched content
+            with open(out_dir / "2_scraped_sources.json", "w") as f:
+                json.dump(autograder_input, f, indent=2, ensure_ascii=False)
+
+            # Score: run the scorer to produce 3_autograder_results.json
+            score_result = grade_task(
+                task_id=task_id,
+                response_text=response_text,
+                criteria=task["criteria"],
+                sources=autograder_input["sources"],
+                product_source_map=autograder_input.get("productSourceMap"),
+                products=existing_products,
+                query=task["prompt"],
+                domain=domain,
+                shop_vs_product=task.get("shop_vs_product", "Product"),
+            )
+        except Exception as score_err:
+            _log(
+                f"  Task {task_id}: SCORING FAILED ({score_err}) — trace saved, skipping score"
+            )
+            result = {
+                "task_id": task_id,
+                "domain": domain,
+                "status": f"score_error: {score_err}",
+                "elapsed": elapsed,
+                "response_len": len(response_text),
+                "searches": n_searches,
+                "browses": n_browses,
+            }
+            if run_id is not None:
+                result["run_id"] = run_id
+            return result
+
+        with open(out_dir / "3_autograder_results.json", "w") as f:
+            json.dump(score_result.to_dict(), f, indent=2, ensure_ascii=False)
+
+        # Update trace with scoring results
+        trace["scoring"] = {
+            "total_score": score_result.total_score,
+            "total_hurdle_score": score_result.total_hurdle_score,
+            "num_criteria": score_result.num_criteria,
+            "products": score_result.products,
+            "summary": score_result.summary,
+            "per_criterion": [
+                {
+                    "criterion_id": r.criterion_id,
+                    "description": r.description,
+                    "type": r.type,
+                    "score": r.score,
+                    "hurdle_tag": r.hurdle_tag,
+                    "stage_reached": r.stage_reached,
+                    "reasoning": r.reasoning,
+                }
+                for r in score_result.detailed_results
+            ],
         }
         with open(out_dir / "trace.json", "w") as f:
             json.dump(trace, f, indent=2, ensure_ascii=False)

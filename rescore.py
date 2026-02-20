@@ -43,7 +43,7 @@ def _has_unenriched_sources(sources: list[dict], min_chars: int = 500) -> bool:
     for src in sources:
         wc = src.get("webpage_content", {})
         markdown = wc.get("markdown", "")
-        if 0 < len(markdown) < min_chars:
+        if 0 < len(markdown) < min_chars and not wc.get("enrichment_error"):
             return True
     return False
 
@@ -59,7 +59,7 @@ def rescore_run(
     sources_path = run_dir / "2_scraped_sources.json"
     results_path = run_dir / "3_autograder_results.json"
 
-    if not all(p.exists() for p in [trace_path, sources_path, results_path]):
+    if not trace_path.exists() or not sources_path.exists():
         return {"dir": str(run_dir), "status": "skip", "reason": "missing files"}
 
     with open(trace_path) as f:
@@ -80,8 +80,9 @@ def rescore_run(
             "reason": "sources already enriched",
         }
 
-    old_score = trace.get("scoring", {}).get("total_score", "?")
-    old_hurdle = trace.get("scoring", {}).get("total_hurdle_score", "?")
+    old_scoring = trace.get("scoring") or {}
+    old_score = old_scoring.get("total_score", "?")
+    old_hurdle = old_scoring.get("total_hurdle_score", "?")
 
     if dry_run:
         unenriched = sum(
@@ -220,7 +221,6 @@ def main():
 
     if args.workers <= 1:
         for i, run_dir in enumerate(run_dirs):
-            _log(f"[{i + 1}/{len(run_dirs)}] {run_dir}")
             result = rescore_run(
                 run_dir, dry_run=args.dry_run, only_failed=not args.all
             )
@@ -228,7 +228,8 @@ def main():
             if result["status"] == "rescored":
                 tag = " CHANGED" if result["changed"] else ""
                 _log(
-                    f"  {result['old_score']} -> {result['new_score']} "
+                    f"[{i + 1}/{len(run_dirs)}] {run_dir}: "
+                    f"{result['old_score']} -> {result['new_score']} "
                     f"(hurdle {result['old_hurdle']} -> {result['new_hurdle']}){tag}"
                 )
     else:
@@ -253,10 +254,6 @@ def main():
                         f"[{i + 1}/{len(run_dirs)}] {run_dir}: "
                         f"{result['old_score']} -> {result['new_score']} "
                         f"(hurdle {result['old_hurdle']} -> {result['new_hurdle']}){tag}"
-                    )
-                elif result["status"] == "skip":
-                    _log(
-                        f"[{i + 1}/{len(run_dirs)}] {run_dir}: skipped ({result['reason']})"
                     )
 
     elapsed = time.time() - start
