@@ -509,7 +509,7 @@ def main(
     parquet: str = "ace_verl_data/test.parquet",
     domains: str = "",
     task_ids: str = "",
-    workers: int = 4,
+    workers: int = 0,
     max_turns: int = 10,
     max_searches: int = 5,
     max_browses: int = 5,
@@ -557,6 +557,16 @@ def main(
     if task_ids:
         id_list = [tid.strip() for tid in task_ids.split(",")]
         tasks = [t for t in tasks if str(t["task_id"]) in id_list]
+
+    # Auto-size workers based on model size if not specified.
+    # Small models (≤16B) leave lots of VRAM headroom → more concurrent sequences.
+    # Large models (>16B) fill VRAM → fewer concurrent sequences.
+    if workers <= 0:
+        any_large = any(_is_large_model(m) for m in model_list)
+        workers = 12 if any_large else 16
+        print(
+            f"Auto-sized workers: {workers} ({'large' if any_large else 'small'} model)"
+        )
 
     print(f"Tasks: {len(tasks)}")
     print(f"Models: {[m.split('/')[-1] for m in model_list]}")

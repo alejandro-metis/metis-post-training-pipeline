@@ -184,9 +184,12 @@ CLI flags for `ace_eval_modal.py`:
 - `--judge-model` — override judge (default: gpt-4o via `ACE_JUDGE_MODEL` env)
 - `--prompt` — system prompt preset: `fewshot` (default) or `zeroshot`
 - `--runs` — number of runs per task (default: 1). Use >1 for variance estimation. Results stored in `task_{id}/run_{n}/` subdirectories.
-- `--shards` — number of GPU containers per model (default: 1). Splits tasks across N independent containers for true data parallelism. N shards = Nx throughput at Nx cost.
+- `--shards` — number of GPU containers per model (default: 1). Each shard loads its own model copy. Only use >1 for large models that saturate a single GPU.
+- `--workers` — parallel tasks per container (default: auto — 16 for ≤16B models, 12 for >16B). vLLM batches concurrent requests efficiently.
 
 GPU auto-sizing: <=16B params → 1xH100, >16B → 2xH100
+
+**Important: don't shard small models.** An 8B model uses ~16GB of an 80GB H100, leaving plenty of VRAM for KV cache. Use `--shards 1 --workers 16` (1 GPU, 16 parallel tasks) instead of `--shards 4 --workers 4` (4 GPUs, same throughput, 4x cost). Sharding only makes sense for 32B+ models that fill the GPU.
 
 ### GPT / API models (local, no GPU needed)
 
