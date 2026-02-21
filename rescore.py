@@ -1,18 +1,19 @@
-"""Re-score existing eval results with enriched sources.
+"""Re-score failed hurdle criteria in existing eval results.
 
-Walks eval result directories, re-enriches snippet-only sources via Jina
-(using JINA_API_KEY for higher rate limits), re-runs grade_task(), and
-updates 2_scraped_sources.json, 3_autograder_results.json, and the scoring
-section of trace.json.
+Walks eval result directories, re-enriches snippet-only sources via Jina,
+re-runs grade_criterion() ONLY on failed hurdle criteria (score <= 0,
+hurdle_tag == "Hurdle"), and marks them as rescored so subsequent runs skip them.
+
+Also updates summary.json files with new scores and recomputed aggregates.
 
 Does NOT re-run models or re-do web searches — only re-scores from saved artifacts.
 
 Usage:
-    # Re-score tasks with unenriched sources (default — only re-scores what needs it)
+    # Re-score failed hurdle criteria (skips already-rescored)
     python rescore.py --results-dir eval_results/gpt-5.2_fewshot
 
-    # Force re-score ALL tasks (re-enriches and re-grades everything)
-    python rescore.py --results-dir eval_results/gpt-5.2_fewshot --all
+    # Force re-score even already-rescored hurdle criteria
+    python rescore.py --results-dir eval_results/gpt-5.2_fewshot --force
 
     # Dry run: show what would be re-scored without writing
     python rescore.py --results-dir eval_results --dry-run
@@ -23,11 +24,12 @@ import json
 import sys
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from dataclasses import asdict
 from pathlib import Path
 from threading import Lock
 
 from ace_scoring.product import map_products_to_sources
-from ace_scoring.scorer import grade_task
+from ace_scoring.scorer import grade_criterion
 from ace_scoring.sources import enrich_snippet_sources
 
 _print_lock = Lock()
@@ -38,22 +40,47 @@ def _log(msg: str):
         print(msg, flush=True)
 
 
-def _has_unenriched_sources(sources: list[dict], min_chars: int = 500) -> bool:
-    """Check if any sources have only snippet-level content."""
-    for src in sources:
-        wc = src.get("webpage_content", {})
-        markdown = wc.get("markdown", "")
-        if 0 < len(markdown) < min_chars and not wc.get("enrichment_error"):
-            return True
-    return False
+def _recalculate_task_scores(detailed: list[dict]) -> tuple[list, int, int, dict]:
+    """Recalculate task-level aggregates from detailed criterion results.
+
+    Returns (criteria_scores, total_score, total_hurdle_score, summary).
+    """
+    scores_with_types = []
+    scores = []
+    for r in detailed:
+        s = r.get("score", 0)
+        t = r.get("type", "")
+        h = r.get("hurdle_tag", "Not")
+        scores_with_types.append([s, t, h])
+        scores.append(s)
+
+    total_score = sum(scores)
+    hurdle_scores = [swt[0] for swt in scores_with_types if swt[2] == "Hurdle"]
+    if hurdle_scores and any(s <= 0 for s in hurdle_scores):
+        total_hurdle_score = 0
+    else:
+        total_hurdle_score = total_score
+
+    summary = {
+        "pass_count": sum(1 for s in scores if s == 1),
+        "fail_response_count": sum(1 for s in scores if s == 0),
+        "fail_source_count": sum(1 for s in scores if s == -1),
+        "total": len(scores),
+        "hurdle_count": len(hurdle_scores),
+        "hurdle_pass_count": sum(1 for s in hurdle_scores if s == 1),
+    }
+
+    return scores_with_types, total_score, total_hurdle_score, summary
 
 
-def rescore_run(
-    run_dir: Path, dry_run: bool = False, only_failed: bool = False
-) -> dict:
-    """Re-score a single run directory.
+def rescore_run(run_dir: Path, dry_run: bool = False, force: bool = False) -> dict:
+    """Re-score failed hurdle criteria in a single run directory.
 
-    Returns a result dict with task_id, run, old/new scores, etc.
+    Only re-grades criteria where hurdle_tag == "Hurdle" and score <= 0.
+    Marks rescored criteria with "rescored": true so subsequent runs skip them.
+
+    Args:
+        force: If True, re-score even criteria already marked as rescored.
     """
     trace_path = run_dir / "trace.json"
     sources_path = run_dir / "2_scraped_sources.json"
@@ -62,102 +89,143 @@ def rescore_run(
     if not trace_path.exists() or not sources_path.exists():
         return {"dir": str(run_dir), "status": "skip", "reason": "missing files"}
 
+    if not results_path.exists():
+        return {"dir": str(run_dir), "status": "skip", "reason": "no existing results"}
+
     with open(trace_path) as f:
         trace = json.load(f)
     with open(sources_path) as f:
         autograder_input = json.load(f)
+    with open(results_path) as f:
+        existing_results = json.load(f)
 
     task_id = trace["task_id"]
     domain = trace["domain"]
     sources = autograder_input["sources"]
+    criteria = autograder_input["criteria"]
 
-    # Check if re-enrichment is needed
-    if only_failed and not _has_unenriched_sources(sources):
+    # Find failed hurdle criteria that need rescoring
+    detailed = existing_results.get("detailed_results", [])
+    failed_hurdle_indices = []
+    for i, r in enumerate(detailed):
+        if r.get("hurdle_tag") != "Hurdle":
+            continue
+        if r.get("score", 1) > 0:
+            continue
+        if not force and r.get("rescored", False):
+            continue
+        failed_hurdle_indices.append(i)
+
+    if not failed_hurdle_indices:
         return {
             "dir": str(run_dir),
             "task_id": task_id,
             "status": "skip",
-            "reason": "sources already enriched",
+            "reason": "no failed hurdle criteria to rescore",
         }
 
-    old_scoring = trace.get("scoring") or {}
-    old_score = old_scoring.get("total_score", "?")
-    old_hurdle = old_scoring.get("total_hurdle_score", "?")
+    old_score = existing_results.get("total_score", "?")
+    old_hurdle = existing_results.get("total_hurdle_score", "?")
 
     if dry_run:
-        unenriched = sum(
-            1
-            for s in sources
-            if 0 < len(s.get("webpage_content", {}).get("markdown", "")) < 500
-        )
+        failed_ids = [
+            detailed[i].get("criterion_id", "?") for i in failed_hurdle_indices
+        ]
         return {
             "dir": str(run_dir),
             "task_id": task_id,
             "status": "dry_run",
             "old_score": old_score,
-            "unenriched_sources": unenriched,
+            "old_hurdle": old_hurdle,
+            "failed_hurdle_criteria": failed_ids,
         }
 
-    # Step 1: Re-enrich snippet sources with Jina API key
-    enrich_snippet_sources(sources)
+    # Step 1: Re-enrich snippet sources
+    _, had_transient_failures = enrich_snippet_sources(sources)
 
     # Step 2: Re-map products to sources (source content may have changed)
     response_text = trace["response_text"]
-    query = autograder_input.get("query", trace.get("prompt", ""))
     existing_products = [
         p["product_name"] for p in autograder_input.get("productSourceMap", [])
     ]
     product_source_map = map_products_to_sources(existing_products, sources)
     autograder_input["productSourceMap"] = product_source_map
 
-    # Step 3: Re-run grade_task()
-    criteria = autograder_input["criteria"]
-    score_result = grade_task(
-        task_id=task_id,
-        response_text=response_text,
-        criteria=criteria,
-        sources=sources,
-        product_source_map=product_source_map,
-        products=existing_products,
-        query=query,
-        domain=domain,
-        shop_vs_product=autograder_input.get("shop_vs_product", "Product"),
+    # Step 3: Build criterion lookup from original criteria
+    criteria_by_id = {}
+    for c in criteria:
+        cid = str(c.get("criterion_id", c.get("id", "")))
+        criteria_by_id[cid] = c
+
+    # Step 4: Re-grade only failed hurdle criteria
+    for idx in failed_hurdle_indices:
+        old_result = detailed[idx]
+        cid = str(old_result.get("criterion_id", ""))
+        criterion = criteria_by_id.get(cid)
+        if criterion is None:
+            _log(
+                f"  Warning: criterion {cid} not found in criteria list, using old result"
+            )
+            criterion = old_result
+
+        new_cr = grade_criterion(
+            criterion,
+            response_text,
+            existing_products,
+            sources,
+            product_source_map,
+            domain=domain,
+            shop_vs_product=autograder_input.get("shop_vs_product", "Product"),
+        )
+
+        new_dict = asdict(new_cr)
+        # Only mark as rescored if enrichment had no transient failures —
+        # timeouts/429s leave unmarked so next run retries
+        new_dict["rescored"] = not had_transient_failures
+        detailed[idx] = new_dict
+
+    # Step 5: Recalculate task-level scores
+    scores_with_types, total_score, total_hurdle_score, summary = (
+        _recalculate_task_scores(detailed)
     )
 
-    # Step 4: Write updated files
-    # 4a: Update 2_scraped_sources.json (enriched sources + updated productSourceMap)
+    existing_results["criteria_scores"] = scores_with_types
+    existing_results["total_score"] = total_score
+    existing_results["total_hurdle_score"] = total_hurdle_score
+    existing_results["summary"] = summary
+    existing_results["detailed_results"] = detailed
+
+    # Step 6: Save updated files
     with open(sources_path, "w") as f:
         json.dump(autograder_input, f, indent=2, ensure_ascii=False)
-
-    # 4b: Overwrite 3_autograder_results.json
     with open(results_path, "w") as f:
-        json.dump(score_result.to_dict(), f, indent=2, ensure_ascii=False)
+        json.dump(existing_results, f, indent=2, ensure_ascii=False)
 
-    # 4c: Update scoring section in trace.json
     trace["scoring"] = {
-        "total_score": score_result.total_score,
-        "total_hurdle_score": score_result.total_hurdle_score,
-        "num_criteria": score_result.num_criteria,
-        "products": score_result.products,
-        "summary": score_result.summary,
+        "total_score": total_score,
+        "total_hurdle_score": total_hurdle_score,
+        "num_criteria": existing_results.get("num_criteria", len(criteria)),
+        "products": existing_results.get("products", existing_products),
+        "summary": summary,
         "per_criterion": [
             {
-                "criterion_id": r.criterion_id,
-                "description": r.description,
-                "type": r.type,
-                "score": r.score,
-                "hurdle_tag": r.hurdle_tag,
-                "stage_reached": r.stage_reached,
-                "reasoning": r.reasoning,
+                "criterion_id": r.get("criterion_id", ""),
+                "description": r.get("description", ""),
+                "type": r.get("type", ""),
+                "score": r.get("score", 0),
+                "hurdle_tag": r.get("hurdle_tag", "Not"),
+                "stage_reached": r.get("stage_reached", ""),
+                "reasoning": r.get("reasoning", ""),
+                "rescored": r.get("rescored", False),
             }
-            for r in score_result.detailed_results
+            for r in detailed
         ],
     }
     with open(trace_path, "w") as f:
         json.dump(trace, f, indent=2, ensure_ascii=False)
 
-    new_score = score_result.total_score
-    new_hurdle = score_result.total_hurdle_score
+    new_score = total_score
+    new_hurdle = total_hurdle_score
     changed = old_score != new_score or old_hurdle != new_hurdle
 
     return {
@@ -169,7 +237,86 @@ def rescore_run(
         "old_hurdle": old_hurdle,
         "new_hurdle": new_hurdle,
         "changed": changed,
+        "rescored_criteria": len(failed_hurdle_indices),
     }
+
+
+def update_summaries(results_dir: Path, dry_run: bool = False) -> list[Path]:
+    """Find and update all summary.json files under results_dir.
+
+    Re-reads each task's 3_autograder_results.json to pick up rescored values,
+    then recomputes all aggregates (domain_stats, score_pct, criteria_type_scores)
+    via build_eval_summary().
+
+    Returns list of updated summary paths.
+    """
+    from ace_eval import build_eval_summary
+
+    summary_paths = sorted(results_dir.rglob("summary.json"))
+    updated = []
+
+    for summary_path in summary_paths:
+        with open(summary_path) as f:
+            summary = json.load(f)
+
+        model_dir = summary_path.parent
+        results_list = summary.get("results", [])
+        any_changed = False
+
+        for r in results_list:
+            if r.get("status") != "ok":
+                continue
+
+            task_id = r["task_id"]
+            domain = r.get("domain", "unknown")
+            run_id = r.get("run_id")
+
+            # Find the autograder results file on disk
+            task_dir = model_dir / domain / f"task_{task_id}"
+            if run_id is not None:
+                ag_path = task_dir / f"run_{run_id}" / "3_autograder_results.json"
+            else:
+                ag_path = task_dir / "3_autograder_results.json"
+
+            if not ag_path.exists():
+                continue
+
+            with open(ag_path) as f:
+                ag = json.load(f)
+
+            new_score = ag.get("total_score", r.get("total_score", 0))
+            new_hurdle = ag.get("total_hurdle_score", r.get("total_hurdle_score", 0))
+            new_cs = ag.get("criteria_scores", r.get("criteria_scores", []))
+
+            if new_score != r.get("total_score") or new_hurdle != r.get(
+                "total_hurdle_score"
+            ):
+                any_changed = True
+
+            r["total_score"] = new_score
+            r["total_hurdle_score"] = new_hurdle
+            r["criteria_scores"] = new_cs
+
+        if not any_changed:
+            _log(f"  summary {summary_path}: no score changes")
+            continue
+
+        if dry_run:
+            _log(f"  summary {summary_path}: would update (dry run)")
+            continue
+
+        # Recompute all aggregates
+        model = summary.get("model", "unknown")
+        total_time = summary.get("total_time_seconds", 0)
+        new_summary = build_eval_summary(model, results_list, total_time)
+
+        with open(summary_path, "w") as f:
+            json.dump(new_summary, f, indent=2, ensure_ascii=False)
+
+        _log(f"  summary {summary_path}: updated")
+        updated.append(summary_path)
+
+    return updated
 
 
 def find_run_dirs(results_dir: Path) -> list[Path]:
@@ -182,7 +329,7 @@ def find_run_dirs(results_dir: Path) -> list[Path]:
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Re-score eval results with enriched sources"
+        description="Re-score failed hurdle criteria in eval results"
     )
     parser.add_argument(
         "--results-dir", required=True, help="Path to eval results directory"
@@ -193,9 +340,9 @@ def main():
         help="Show what would be re-scored without writing",
     )
     parser.add_argument(
-        "--all",
+        "--force",
         action="store_true",
-        help="Re-score all tasks, not just ones with unenriched sources",
+        help="Re-score even criteria already marked as rescored",
     )
     parser.add_argument(
         "--workers", type=int, default=8, help="Parallel workers (default: 8)"
@@ -221,16 +368,13 @@ def main():
 
     if args.workers <= 1:
         for i, run_dir in enumerate(run_dirs):
-            result = rescore_run(
-                run_dir, dry_run=args.dry_run, only_failed=not args.all
-            )
+            result = rescore_run(run_dir, dry_run=args.dry_run, force=args.force)
             results.append(result)
-            if result["status"] == "rescored":
-                tag = " CHANGED" if result["changed"] else ""
+            if result["status"] == "rescored" and result["changed"]:
                 _log(
-                    f"[{i + 1}/{len(run_dirs)}] {run_dir}: "
+                    f"  {run_dir}: "
                     f"{result['old_score']} -> {result['new_score']} "
-                    f"(hurdle {result['old_hurdle']} -> {result['new_hurdle']}){tag}"
+                    f"(hurdle {result['old_hurdle']} -> {result['new_hurdle']})"
                 )
     else:
         with ThreadPoolExecutor(max_workers=args.workers) as executor:
@@ -240,7 +384,7 @@ def main():
                     rescore_run,
                     run_dir,
                     dry_run=args.dry_run,
-                    only_failed=not args.all,
+                    force=args.force,
                 )
                 futures[fut] = run_dir
 
@@ -248,35 +392,29 @@ def main():
                 result = fut.result()
                 results.append(result)
                 run_dir = futures[fut]
-                if result["status"] == "rescored":
-                    tag = " CHANGED" if result["changed"] else ""
+                if result["status"] == "rescored" and result["changed"]:
                     _log(
-                        f"[{i + 1}/{len(run_dirs)}] {run_dir}: "
+                        f"  {run_dir}: "
                         f"{result['old_score']} -> {result['new_score']} "
-                        f"(hurdle {result['old_hurdle']} -> {result['new_hurdle']}){tag}"
+                        f"(hurdle {result['old_hurdle']} -> {result['new_hurdle']})"
                     )
 
     elapsed = time.time() - start
 
-    # Summary
-    rescored = [r for r in results if r["status"] == "rescored"]
-    changed = [r for r in rescored if r.get("changed")]
+    retried = [r for r in results if r["status"] == "rescored"]
+    changed = [r for r in retried if r.get("changed")]
     skipped = [r for r in results if r["status"] == "skip"]
-
     _log(f"\n{'=' * 60}")
     _log(
-        f"Total: {len(results)}, Re-scored: {len(rescored)}, "
-        f"Changed: {len(changed)}, Skipped: {len(skipped)}"
+        f"Total: {len(results)}, Retried: {len(retried)} "
+        f"({len(changed)} changed), Skipped: {len(skipped)}"
     )
     _log(f"Time: {elapsed:.1f}s")
 
-    if changed:
-        _log("\nScore changes:")
-        for r in sorted(changed, key=lambda x: x["dir"]):
-            _log(
-                f"  {r['dir']}: {r['old_score']} -> {r['new_score']} "
-                f"(hurdle {r['old_hurdle']} -> {r['new_hurdle']})"
-            )
+    # Update summary.json files
+    if retried:
+        _log("\nUpdating summary.json files...")
+        update_summaries(results_dir, dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

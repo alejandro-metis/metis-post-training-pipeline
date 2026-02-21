@@ -36,7 +36,11 @@ from ace_eval_prompts import DEFAULT_PROMPT, get_prompt, list_prompts
 from ace_scoring.jina import extract_title, fetch_page
 from ace_scoring.product import extract_products, map_products_to_sources
 from ace_scoring.scorer import grade_task
-from ace_scoring.sources import enrich_snippet_sources, sources_from_tool_history
+from ace_scoring.sources import (
+    enrich_snippet_sources,
+    sources_from_annotations,
+    sources_from_tool_history,
+)
 from ace_scoring.types import format_criteria_for_autograder
 
 # Tool definitions for the model (OpenAI function calling format)
@@ -157,6 +161,7 @@ def run_agent_loop(
     max_turns: int = 10,
     max_searches: int = 5,
     max_browses: int = 5,
+    reasoning_effort: str | None = None,
 ) -> tuple[str, dict]:
     """Run a model with tools until it produces a final response.
 
@@ -174,12 +179,15 @@ def run_agent_loop(
     browse_count = 0
 
     for turn in range(max_turns):
-        response = client.chat.completions.create(
-            model=model,
-            messages=messages,
-            tools=TOOLS,
-            tool_choice="auto",
-        )
+        create_kwargs: dict = {
+            "model": model,
+            "messages": messages,
+            "tools": TOOLS,
+            "tool_choice": "auto",
+        }
+        if reasoning_effort is not None:
+            create_kwargs["reasoning_effort"] = reasoning_effort
+        response = client.chat.completions.create(**create_kwargs)
 
         choice = response.choices[0]
 
@@ -241,6 +249,53 @@ def run_agent_loop(
     return "", tool_history
 
 
+def run_native_search(
+    client: OpenAI,
+    model: str,
+    prompt: str,
+    system_prompt: str = "",
+    reasoning_effort: str | None = None,
+) -> tuple[str, list[dict], dict]:
+    """Call OpenAI Responses API with built-in web_search tool.
+
+    Single API call — the model searches the web internally. Returns
+    (response_text, annotations, raw_response_dict) where annotations
+    are url_citation dicts with url, title, start_index, end_index.
+    """
+    create_kwargs: dict = {
+        "model": model,
+        "input": prompt,
+        "tools": [{"type": "web_search"}],
+    }
+    if system_prompt:
+        create_kwargs["instructions"] = system_prompt
+    if reasoning_effort is not None:
+        create_kwargs["reasoning"] = {"effort": reasoning_effort}
+
+    response = client.responses.create(**create_kwargs)
+    raw_dict = response.model_dump()
+    response_text = response.output_text
+
+    # Extract url_citation annotations from output_text content blocks
+    annotations = []
+    for output_item in response.output:
+        if output_item.type == "message":
+            for content_item in output_item.content:
+                if content_item.type == "output_text":
+                    for ann in content_item.annotations:
+                        if ann.type == "url_citation":
+                            annotations.append(
+                                {
+                                    "url": ann.url,
+                                    "title": ann.title,
+                                    "start_index": ann.start_index,
+                                    "end_index": ann.end_index,
+                                }
+                            )
+
+    return response_text, annotations, raw_dict
+
+
 def load_tasks_from_parquet(parquet_path: str) -> list[dict]:
     """Load ACE tasks from verl-format parquet."""
     table = pq.read_table(parquet_path)
@@ -283,11 +338,15 @@ def eval_single_task(
     max_searches: int = 5,
     max_browses: int = 5,
     run_id: int | None = None,
+    reasoning_effort: str | None = None,
+    native_search: bool = False,
 ) -> dict:
     """Evaluate a single ACE task. Thread-safe.
 
     Returns a result dict with task_id, domain, status, elapsed, etc.
     If run_id is set, results go into task_{id}/run_{run_id}/ subdirectory.
+    When native_search is True, uses OpenAI Responses API with built-in
+    web_search instead of the custom agent loop.
     """
     task_id = task["task_id"]
     domain = task["domain"]
@@ -297,28 +356,51 @@ def eval_single_task(
     start = time.time()
 
     try:
-        response_text, tool_history = run_agent_loop(
-            client=client,
-            model=model,
-            prompt=task["prompt"],
-            searchapi_key=searchapi_key,
-            system_prompt=system_prompt,
-            max_turns=max_turns,
-            max_searches=max_searches,
-            max_browses=max_browses,
-        )
+        if native_search:
+            response_text, annotations, raw_response = run_native_search(
+                client=client,
+                model=model,
+                prompt=task["prompt"],
+                system_prompt=system_prompt,
+                reasoning_effort=reasoning_effort,
+            )
+            sources = sources_from_annotations(annotations, response_text)
+            tool_history = None
+            n_searches = 0
+            n_browses = 0
+            n_unique_urls = len(set(a["url"] for a in annotations))
+            elapsed = time.time() - start
+            _log(
+                f"  Task {task_id}: {len(response_text)} chars, "
+                f"{n_unique_urls} cited URLs, {len(annotations)} citations ({elapsed:.1f}s)"
+            )
+        else:
+            response_text, tool_history = run_agent_loop(
+                client=client,
+                model=model,
+                prompt=task["prompt"],
+                searchapi_key=searchapi_key,
+                system_prompt=system_prompt,
+                max_turns=max_turns,
+                max_searches=max_searches,
+                max_browses=max_browses,
+                reasoning_effort=reasoning_effort,
+            )
+            raw_response = None
+            annotations = None
+            n_unique_urls = 0
+            elapsed = time.time() - start
+            n_searches = len(tool_history["searches"])
+            n_browses = len(tool_history["browsed_pages"])
+            _log(
+                f"  Task {task_id}: {len(response_text)} chars, "
+                f"{n_searches} searches, {n_browses} browses ({elapsed:.1f}s)"
+            )
+            sources = sources_from_tool_history(tool_history)
 
-        elapsed = time.time() - start
-        n_searches = len(tool_history["searches"])
-        n_browses = len(tool_history["browsed_pages"])
-        _log(
-            f"  Task {task_id}: {len(response_text)} chars, {n_searches} searches, {n_browses} browses ({elapsed:.1f}s)"
-        )
-
-        # Build autograder-compatible JSON (inlined from ace_grounding_wrapper)
+        # Build autograder-compatible JSON
         from datetime import datetime
 
-        sources = sources_from_tool_history(tool_history)
         product_names = extract_products(response_text, task["prompt"])
         product_source_map = map_products_to_sources(product_names, sources)
         formatted_criteria = format_criteria_for_autograder(task["criteria"])
@@ -356,19 +438,26 @@ def eval_single_task(
             json.dump(autograder_input, f, indent=2, ensure_ascii=False)
 
         # 2. Save trace immediately (before scoring) so model response is never lost
-        trace = {
+        trace: dict = {
             "task_id": task_id,
             "domain": domain,
             "model": model,
             "prompt": task["prompt"],
             "response_text": response_text,
-            "tool_history": tool_history,
-            "num_searches": n_searches,
-            "num_browses": n_browses,
+            "search_mode": "native" if native_search else "agent_loop",
             "num_criteria": len(task["criteria"]),
             "elapsed_seconds": round(elapsed, 2),
             "scoring": None,
         }
+        if native_search:
+            trace["annotations"] = annotations
+            trace["raw_response"] = raw_response
+            trace["num_citations"] = len(annotations) if annotations else 0
+            trace["num_unique_urls"] = n_unique_urls
+        else:
+            trace["tool_history"] = tool_history
+            trace["num_searches"] = n_searches
+            trace["num_browses"] = n_browses
         with open(out_dir / "trace.json", "w") as f:
             json.dump(trace, f, indent=2, ensure_ascii=False)
 
@@ -378,7 +467,12 @@ def eval_single_task(
         ]
         try:
             # Enrich snippet-only sources with full page content via Jina
-            enrich_snippet_sources(autograder_input["sources"])
+            # Native search sources all have empty markdown — need higher limit
+            max_enrich = 20 if native_search else 10
+            _, had_enrichment_failures = enrich_snippet_sources(
+                autograder_input["sources"],
+                max_sources_to_enrich=max_enrich,
+            )
 
             # Rewrite 2_scraped_sources.json with enriched content
             with open(out_dir / "2_scraped_sources.json", "w") as f:
@@ -482,7 +576,7 @@ def build_eval_summary(model: str, results: list[dict], total_time: float) -> di
     aggregation with mean/std scores.
 
     Computes ACE-style metrics (matching paper Tables 2 & 3):
-    - ace_scores: overall and per-domain percentage scores
+    - score_pct / hurdle_score_pct: overall and per-domain percentage scores
     - criteria_type_scores: per criteria-type pass rates per domain
     """
     from collections import defaultdict
@@ -515,20 +609,9 @@ def build_eval_summary(model: str, results: list[dict], total_time: float) -> di
         else:
             domain_stats[d]["failed"] += 1
 
-    summary = {
-        "model": model,
-        "total_tasks": len(results),
-        "completed": ok,
-        "failed": failed,
-        "total_time_seconds": round(total_time, 1),
-        "avg_time_per_task": round(sum(r["elapsed"] for r in ok_results) / ok, 2)
-        if ok
-        else 0,
-        "total_searches": sum(r.get("searches", 0) for r in ok_results),
-        "total_browses": sum(r.get("browses", 0) for r in ok_results),
-        "domain_stats": domain_stats,
-        "results": results,
-    }
+    total_score_all = sum(ds["total_score"] for ds in domain_stats.values())
+    total_hurdle_all = sum(ds["total_hurdle_score"] for ds in domain_stats.values())
+    total_criteria_all = sum(ds["total_criteria"] for ds in domain_stats.values())
 
     # -- Per-task aggregation across runs (mean/std) --
     by_task: dict[str, list[dict]] = defaultdict(list)
@@ -553,7 +636,6 @@ def build_eval_summary(model: str, results: list[dict], total_time: float) -> di
             "score_pct": round(statistics.mean(score_pcts), 1),
             "hurdle_score_pct": round(statistics.mean(hurdle_pcts), 1),
         }
-    summary["task_aggregation"] = task_agg
 
     # -- ACE-style percentage scores (paper Table 2) --
     # Per-task pct = mean(hurdle_score / num_criteria * 100) across runs
@@ -566,38 +648,29 @@ def build_eval_summary(model: str, results: list[dict], total_time: float) -> di
         domain_task_pcts[d].append(tagg["hurdle_score_pct"])
         domain_task_raw_pcts[d].append(tagg["score_pct"])
 
-    ace_domain_scores = {}
     all_task_pcts: list[float] = []
     all_task_raw_pcts: list[float] = []
     for d in sorted(domain_task_pcts.keys()):
         pcts = domain_task_pcts[d]
         raw_pcts = domain_task_raw_pcts[d]
-        ace_domain_scores[d] = {
-            "score_pct": round(statistics.mean(pcts), 1),
-            "raw_score_pct": round(statistics.mean(raw_pcts), 1),
-            "num_tasks": len(pcts),
-        }
-        if len(pcts) > 1:
-            ace_domain_scores[d]["std_pct"] = round(statistics.stdev(pcts), 1)
+        # Add pct scores into domain_stats
+        ds = domain_stats[d]
+        ds["score_pct"] = round(statistics.mean(raw_pcts), 1)
+        ds["hurdle_score_pct"] = round(statistics.mean(pcts), 1)
+        ds["std_pct"] = round(statistics.stdev(pcts), 1) if len(pcts) > 1 else 0.0
         all_task_pcts.extend(pcts)
         all_task_raw_pcts.extend(raw_pcts)
 
-    ace_scores: dict = {
-        "overall": round(statistics.mean(all_task_pcts), 1) if all_task_pcts else 0.0,
-        "overall_raw": round(statistics.mean(all_task_raw_pcts), 1)
-        if all_task_raw_pcts
-        else 0.0,
-        "num_tasks": len(all_task_pcts),
-        "domains": ace_domain_scores,
-    }
-    if len(all_task_pcts) > 1:
-        ace_scores["overall_std"] = round(statistics.stdev(all_task_pcts), 1)
-    summary["ace_scores"] = ace_scores
+    overall_pct = round(statistics.mean(all_task_pcts), 1) if all_task_pcts else 0.0
+    overall_raw_pct = (
+        round(statistics.mean(all_task_raw_pcts), 1) if all_task_raw_pcts else 0.0
+    )
+    overall_std = (
+        round(statistics.stdev(all_task_pcts), 1) if len(all_task_pcts) > 1 else 0.0
+    )
 
     # -- Per criteria-type scores (paper Table 3) --
-    # Group criterion scores by (domain, type), compute mean score * 100
-    # Note: score_pct can be negative for grounded criteria (Shopping/Gaming)
-    # since hallucination scores -1. For non-grounded (DIY/Food) it equals pass rate.
+    criteria_type_scores = {}
     has_criteria_scores = any(r.get("criteria_scores") for r in ok_results)
     if has_criteria_scores:
         # criteria_scores: [[score, type, hurdle_tag], ...]
@@ -610,7 +683,6 @@ def build_eval_summary(model: str, results: list[dict], total_time: float) -> di
                 score, ctype, _hurdle = cs
                 type_scores[d][ctype].append(score)
 
-        criteria_type_scores = {}
         for d in sorted(type_scores.keys()):
             criteria_type_scores[d] = {}
             for ctype in sorted(type_scores[d].keys()):
@@ -619,7 +691,30 @@ def build_eval_summary(model: str, results: list[dict], total_time: float) -> di
                     "score_pct": round(statistics.mean(scores) * 100, 1),
                     "count": len(scores),
                 }
-        summary["criteria_type_scores"] = criteria_type_scores
+
+    # -- Build summary with scores at the top --
+    summary = {
+        "model": model,
+        "total_tasks": len(results),
+        "completed": ok,
+        "failed": failed,
+        "score_pct": overall_raw_pct,
+        "hurdle_score_pct": overall_pct,
+        "std_pct": overall_std,
+        "total_score": total_score_all,
+        "total_hurdle_score": total_hurdle_all,
+        "total_criteria": total_criteria_all,
+        "domain_stats": domain_stats,
+        "criteria_type_scores": criteria_type_scores,
+        "task_aggregation": task_agg,
+        "total_time_seconds": round(total_time, 1),
+        "avg_time_per_task": round(sum(r["elapsed"] for r in ok_results) / ok, 2)
+        if ok
+        else 0,
+        "total_searches": sum(r.get("searches", 0) for r in ok_results),
+        "total_browses": sum(r.get("browses", 0) for r in ok_results),
+        "results": results,
+    }
 
     return summary
 
@@ -638,6 +733,8 @@ def run_eval_for_model(
     system_prompt: str = "",
     prompt_name: str = "",
     runs: int = 1,
+    reasoning_effort: str | None = None,
+    native_search: bool = False,
 ) -> list[dict]:
     """Run eval for a single model across all tasks, with parallel workers.
 
@@ -648,7 +745,17 @@ def run_eval_for_model(
     model_dir = model.replace("/", "_")
     if prompt_name:
         model_dir = f"{model_dir}_{prompt_name}"
-    client = OpenAI(api_key=api_key, base_url=api_base)
+    if native_search:
+        model_dir = f"{model_dir}_native"
+
+    # Reasoning models with native search can be very slow — use 1500s timeout
+    if native_search:
+        client = OpenAI(
+            api_key=api_key,
+            timeout=httpx.Timeout(1500.0, connect=10.0),
+        )
+    else:
+        client = OpenAI(api_key=api_key, base_url=api_base)
 
     # Expand tasks × runs into work items
     use_run_id = runs > 1
@@ -686,6 +793,8 @@ def run_eval_for_model(
                 max_searches=max_searches,
                 max_browses=max_browses,
                 run_id=run_id,
+                reasoning_effort=reasoning_effort,
+                native_search=native_search,
             )
             results.append(result)
     else:
@@ -708,6 +817,8 @@ def run_eval_for_model(
                     max_searches=max_searches,
                     max_browses=max_browses,
                     run_id=run_id,
+                    reasoning_effort=reasoning_effort,
+                    native_search=native_search,
                 )
                 futures[fut] = (task["task_id"], run_id)
 
@@ -823,11 +934,13 @@ def rebuild_summary(results_dir: str) -> None:
     with open(summary_file, "w") as f:
         json.dump(summary, f, indent=2, ensure_ascii=False)
 
-    ace = summary.get("ace_scores", {})
     print(f"\nACE Scores for {model_name}:")
-    print(f"  Overall: {ace.get('overall', 0)}%")
-    for d, ds in ace.get("domains", {}).items():
-        print(f"  {d:>10}: {ds['score_pct']}%")
+    print(
+        f"  Overall: {summary.get('hurdle_score_pct', 0)}% "
+        f"(raw: {summary.get('score_pct', 0)}%)"
+    )
+    for d, ds in summary.get("domain_stats", {}).items():
+        print(f"  {d:>10}: {ds.get('hurdle_score_pct', '?')}%")
 
     if "criteria_type_scores" in summary:
         print("\nCriteria Type Breakdown:")
@@ -912,6 +1025,22 @@ def main():
         default=1,
         help="Number of runs per task (default: 1). Use >1 for variance estimation.",
     )
+    parser.add_argument(
+        "--reasoning-effort",
+        choices=["low", "medium", "high"],
+        default=None,
+        help="Reasoning effort for reasoning models (e.g. gpt-5.2). Default: none.",
+    )
+    parser.add_argument(
+        "--native-search",
+        action="store_true",
+        default=False,
+        help=(
+            "Use OpenAI Responses API with built-in web_search instead of "
+            "custom agent loop. Only works with OpenAI models (gpt-5.2, etc.). "
+            "Ignores --max_turns, --max_searches, --max_browses."
+        ),
+    )
     args = parser.parse_args()
 
     # Rebuild summary mode — no model needed
@@ -927,11 +1056,21 @@ def main():
     if args.judge_model:
         os.environ["ACE_JUDGE_MODEL"] = args.judge_model
 
-    system_prompt = get_prompt(args.prompt)
-    _log(f"Prompt preset: {args.prompt}")
+    # System prompt: native search defaults to none (matches leaderboard)
+    if args.native_search and args.prompt == DEFAULT_PROMPT:
+        system_prompt = ""
+        prompt_name = ""  # run_eval_for_model appends _native suffix
+        _log("Native search mode (OpenAI Responses API, no system prompt)")
+    else:
+        system_prompt = get_prompt(args.prompt)
+        prompt_name = args.prompt
+        _log(f"Prompt preset: {args.prompt}")
 
     api_key = args.api_key or os.environ.get("OPENAI_API_KEY", "")
-    searchapi_key = args.searchapi_key or os.environ.get("SEARCHAPI_IO_KEY", "")
+    if args.native_search:
+        searchapi_key = ""  # Not needed for native search
+    else:
+        searchapi_key = args.searchapi_key or os.environ.get("SEARCHAPI_IO_KEY", "")
 
     models = args.models if args.models else [args.model]
 
@@ -961,8 +1100,10 @@ def main():
             max_searches=args.max_searches,
             max_browses=args.max_browses,
             system_prompt=system_prompt,
-            prompt_name=args.prompt,
+            prompt_name=prompt_name,
             runs=args.runs,
+            reasoning_effort=args.reasoning_effort,
+            native_search=args.native_search,
         )
         all_results[model] = results
 

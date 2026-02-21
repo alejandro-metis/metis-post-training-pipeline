@@ -53,19 +53,57 @@ def sources_from_tool_history(tool_history: dict) -> list[dict]:
     return sources
 
 
+def sources_from_annotations(annotations: list[dict], response_text: str) -> list[dict]:
+    """Build autograder-compatible sources from Responses API URL citations.
+
+    Each unique URL becomes a source with empty markdown (to be enriched
+    via Jina). Citation text (derived from response_text character indices)
+    stored as relevant_text.
+    """
+    sources: list[dict] = []
+    seen_urls: dict[str, int] = {}  # url -> index in sources list
+
+    for ann in annotations:
+        url = ann.get("url", "")
+        if not url:
+            continue
+        if url not in seen_urls:
+            seen_urls[url] = len(sources)
+            sources.append(
+                _make_source(
+                    len(sources) + 1,
+                    ann.get("title", url),
+                    url,
+                    markdown="",  # enrich_snippet_sources will fetch via Jina
+                )
+            )
+        # Derive cited text from character indices in response_text
+        # (SDK annotation has start_index/end_index but no cited_text field)
+        start = ann.get("start_index", 0)
+        end = ann.get("end_index", 0)
+        if 0 <= start < end <= len(response_text):
+            cited_text = response_text[start:end]
+            sources[seen_urls[url]]["relevant_text"].append(cited_text)
+
+    return sources
+
+
 def enrich_snippet_sources(
     sources: list[dict],
     min_content_chars: int = 500,
     max_chars_per_source: int = 30000,
     max_sources_to_enrich: int = 10,
-) -> list[dict]:
+) -> tuple[list[dict], bool]:
     """Scrape full page content for sources that only have snippets.
 
     Sources from search results only have ~150-char snippets. This fetches
     actual page content via Jina Reader so Stage 2 grounding checks are
-    meaningful. Modifies sources in-place and returns the list.
+    meaningful. Modifies sources in-place.
+
+    Returns (sources, had_transient_failures).
     """
     enriched = 0
+    had_transient_failures = False
     for src in sources:
         if enriched >= max_sources_to_enrich:
             break
@@ -95,6 +133,8 @@ def enrich_snippet_sources(
             )
             if not transient:
                 wc["enrichment_error"] = err
+            else:
+                had_transient_failures = True
             continue
 
         title = extract_title(page_markdown, fallback=url)
@@ -103,7 +143,7 @@ def enrich_snippet_sources(
         src["source_title"] = title
         enriched += 1
 
-    return sources
+    return sources, had_transient_failures
 
 
 def sources_from_response_urls(
