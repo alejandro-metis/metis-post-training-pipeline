@@ -200,7 +200,7 @@ def _run_eval_inner(
             "--tool-call-parser",
             tool_parser,
             "--max-model-len",
-            "16384",
+            "32768",
         ],
         stdout=subprocess.PIPE,
         stderr=subprocess.STDOUT,
